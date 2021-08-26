@@ -1,0 +1,17 @@
+{
+    "name": "lisachenko/php-shared-data-extension",
+    "description": "Shared data extension for PHP",
+    "type": "library",
+    "require": {
+        "lisachenko/z-engine": "^0.8.1|^0.9.1",
+        "php": "^7.4|^8.0"
+    },
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Lisachenko Alexander",
+            "email": "lisachenko.it@gmail.com"
+        }
+    ],
+    "minimum-stability": "dev"
+}
