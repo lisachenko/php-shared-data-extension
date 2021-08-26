@@ -13,5 +13,10 @@
             "email": "lisachenko.it@gmail.com"
         }
     ],
+    "autoload": {
+        "psr-4": {
+            "Lisachenko\\SharedData\\": "src/"
+        }
+    },
     "minimum-stability": "dev"
 }
