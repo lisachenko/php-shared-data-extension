@@ -1,18 +1,17 @@
 # Shared Data Extension for PHP
 
-Persistent memory for PHP, written in PHP — powered by
-[lisachenko/z-engine](https://github.com/lisachenko/z-engine) and FFI.
+[![CI](https://github.com/lisachenko/php-shared-data-extension/actions/workflows/ci.yml/badge.svg)](https://github.com/lisachenko/php-shared-data-extension/actions/workflows/ci.yml)
+[![Latest Version](https://img.shields.io/packagist/v/lisachenko/php-shared-data-extension?include_prereleases)](https://packagist.org/packages/lisachenko/php-shared-data-extension)
+[![PHP 8.4](https://img.shields.io/badge/php-8.4-777BB3.svg?logo=php&logoColor=white)](composer.json)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Two features, one persistent module:
+**PHP objects that survive the request boundary. In pure PHP.**
 
-1. **Shared C data** (the original demo): module globals with a raw C structure
-   that survives the request boundary in a worker process — counters, flags,
-   fixed-size tables. See `demo.php`.
-2. **Persistent PHP objects**: full PHP objects whose state survives the request
-   boundary, like interned strings do — held in a persistent object table with a
-   pinned refcount so the engine never reclaims them. See `demos/demo-objects.php`.
-
-## Persistent objects in 30 seconds
+Every PHP request pays the same tax: rebuild the framework kernel, reboot the DI
+container, reparse the configuration — throw it all away, repeat. This library
+deletes that tax. Persist an object **once per worker** and get the very same,
+fully-initialized instance back on every subsequent request — no serialization,
+no cache round-trip, no C extension to compile. Just `composer require` and FFI.
 
 ```php
 use Lisachenko\SharedData\PersistentStore;
@@ -26,22 +25,44 @@ if (!$store->has(AppConfig::class)) {
     // Expensive one-time initialization: runs ONCE per worker process
     $config = $store->persist(AppConfig::class, buildExpensiveConfig());
 } else {
-    // Every later request in this worker: instant recovery, no re-initialization
+    // Every later request in this worker: instant recovery, zero rebuild cost
     $config = $store->get(AppConfig::class);
 }
 ```
 
-Storage is keyed by `ClassName::class` (a class or interface of the instance), so
-static analysis and IDE autocompletion know the type: `get(AppConfig::class)` is
-inferred as `AppConfig` through PHPStan generic templates.
+## Why you'll like it
 
-Use cases: framework kernel, a booted DI container, configuration/route/metadata
-objects — anything expensive to build and read-mostly afterwards.
+- ⚡ **Zero rebuild cost** — kernels, containers, config and route tables are
+  built once per worker and reattached in microseconds on every request.
+- 🧠 **Real objects, not copies** — the state lives in the engine's own
+  persistent memory, the same trick PHP uses for interned strings; reads are
+  zero-copy and mutations copy-on-write into request memory.
+- 🎯 **Typed API** — storage is keyed by `ClassName::class` with PHPStan generic
+  templates, so `$store->get(AppConfig::class)` autocompletes as `AppConfig`.
+- 🛡 **Frozen by design** — request-time mutations roll back at shutdown; a
+  request can never corrupt the persisted state for the next one.
+- 🔭 **Observable** — `phpinfo()` shows exactly what is persisted, and the
+  engine itself enforces the `ext-ffi` dependency.
+- 🧩 **Pure PHP** — powered by [lisachenko/z-engine](https://github.com/lisachenko/z-engine),
+  which gives PHP direct FFI access to its own engine internals. Nothing to
+  compile, nothing to install beyond Composer.
+
+The proof lives in CI: a FastCGI gate drives hundreds of *real* requests through
+one worker and asserts the object is built exactly once, survives every
+RINIT/RSHUTDOWN boundary, and sheds every mutation — plus a 5000-cycle soak that
+fails on a single leaked byte of request memory.
+
+Two features share one persistent module:
+
+1. **Persistent PHP objects** (above) — see `demos/demo-objects.php`.
+2. **Shared C data** (the original demo): module globals with a raw C structure
+   surviving the request boundary — counters, flags, fixed-size tables. See
+   `demo.php`.
 
 ## How it works
 
-`persist($name, $object)` deep-converts the object's state into persistent
-(malloc) memory and returns a **new canonical instance**:
+`persist(ClassName::class, $object)` deep-converts the object's state into
+persistent (malloc) memory and returns a **new canonical instance**:
 
 - the `zend_object` itself becomes a malloc-backed clone with its refcount
   pinned high, flagged non-collectable (the cycle collector never scans it) and
@@ -121,11 +142,14 @@ $store->detach(): void;                    // runs automatically at request shut
 
 ```bash
 composer install
-vendor/bin/phpunit                     # unit + lifecycle tests
-php -d ffi.enable=1 tools/soak.php     # 5k attach/mutate/detach cycles, flat-memory gate
+vendor/bin/phpunit                       # unit + lifecycle tests
+php -d ffi.enable=1 tools/soak.php       # 5k attach/mutate/detach cycles, flat-memory gate
+bash tools/request-boundary/run.sh 100   # real RINIT/RSHUTDOWN boundaries via php-cgi/FastCGI
 php -d ffi.enable=1 demos/demo-objects.php
-php -d ffi.enable=1 demo.php           # original shared C data demo
+php -d ffi.enable=1 demo.php             # original shared C data demo
 ```
+
+CI runs all of the above on every push and pull request.
 
 ## Requirements
 
