@@ -1,0 +1,9 @@
+# Keep dist installs lean: development-only files are excluded from archives
+/.gitattributes        export-ignore
+/.gitignore            export-ignore
+/.github/              export-ignore
+/demos/                export-ignore
+/tests/                export-ignore
+/tools/                export-ignore
+/demo.php              export-ignore
+/phpunit.xml.dist      export-ignore
