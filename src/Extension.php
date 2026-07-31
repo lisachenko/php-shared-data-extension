@@ -46,16 +46,6 @@ class Extension extends AbstractModule
     }
 
     /**
-     * Returns the target API version for this module
-     *
-     * @see zend_modules.h:ZEND_MODULE_API_NO
-     */
-    public static function targetApiVersion(): int
-    {
-        return 20190902;
-    }
-
-    /**
      * Returns true if this module should be persistent or false if temporary
      */
     public static function targetPersistent(): bool
