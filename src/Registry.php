@@ -20,21 +20,33 @@ use ZEngine\Type\PersistentHashTable;
 use ZEngine\Type\StringEntry;
 
 /**
- * Persistent name => object metadata store, anchored in the module globals
+ * Persistent name => object graph metadata store, anchored in the module globals
  *
- * Layout (everything in persistent memory, valid across requests):
+ * Layout v2 (everything in persistent memory, valid across requests):
  *
  *   root table:  name (interned) => IS_PTR to a per-entry metadata table
- *   entry table: 'root'      => IS_PTR  zend_object* of the persistent clone
- *                'snapshot'  => IS_PTR  char* frozen properties_table image
- *                'class'     => IS_STRING interned class name
- *                'signature' => IS_STRING interned layout signature
+ *   entry table: 'count'      => IS_LONG number of objects in the persisted graph
+ *                'objects'    => IS_PTR  to a graph table: index => IS_PTR zend_object*
+ *                'snapshots'  => IS_PTR  to a graph table: index => IS_PTR char*
+ *                'classes'    => IS_PTR  to a graph table: index => IS_STRING class name
+ *                'signatures' => IS_PTR  to a graph table: index => IS_STRING signature
  *
- * The root and entry tables stay mutable (they are registries, not user data);
+ * The four graph tables are index-keyed and parallel: index 0 is the graph root (the
+ * object handed back by persist()/get()), every other index is an object reachable from
+ * it. Layout v1 stored a single object per entry ('root'/'snapshot'/'class'/'signature');
+ * the module globals carry LAYOUT_VERSION so a worker that still holds a v1 registry is
+ * rejected instead of misread - see PersistentStore::boot().
+ *
+ * The root, entry and graph tables stay mutable (they are registries, not user data);
  * only converted user payloads are sealed immutable by the Persister.
  */
 final class Registry
 {
+    /**
+     * Version tag of the persistent layout described above, stored in module globals[1]
+     */
+    public const LAYOUT_VERSION = 2;
+
     public function __construct(private PersistentHashTable $root)
     {
     }
@@ -68,12 +80,24 @@ final class Registry
 
     public function store(string $name, PersistedEntry $entry): void
     {
-        $meta = PersistentHashTable::create();
+        $objects    = PersistentHashTable::create();
+        $snapshots  = PersistentHashTable::create();
+        $classes    = PersistentHashTable::create();
+        $signatures = PersistentHashTable::create();
 
-        $this->addPointer($meta, 'root', $entry->object);
-        $this->addPointer($meta, 'snapshot', $entry->snapshot);
-        $this->addInternedString($meta, 'class', $entry->className);
-        $this->addInternedString($meta, 'signature', $entry->signature);
+        foreach ($entry->objects as $index => $object) {
+            $this->addPointer($objects, $index, $object);
+            $this->addPointer($snapshots, $index, $entry->snapshots[$index]);
+            $this->addInternedString($classes, $index, $entry->classNames[$index]);
+            $this->addInternedString($signatures, $index, $entry->signatures[$index]);
+        }
+
+        $meta = PersistentHashTable::create();
+        $this->addLong($meta, 'count', $entry->count());
+        $this->addPointer($meta, 'objects', $objects->getRawValue());
+        $this->addPointer($meta, 'snapshots', $snapshots->getRawValue());
+        $this->addPointer($meta, 'classes', $classes->getRawValue());
+        $this->addPointer($meta, 'signatures', $signatures->getRawValue());
 
         $this->addPointer($this->root, $name, $meta->getRawValue());
     }
@@ -121,16 +145,36 @@ final class Registry
     private function hydrate(ReflectionValue $metaValue): PersistedEntry
     {
         $meta = PersistentHashTable::fromCData(Core::cast('HashTable *', $metaValue->getRawPointer()));
+        $meta->find('count')->getNativeValue($count);
 
-        $meta->find('class')->getNativeValue($className);
-        $meta->find('signature')->getNativeValue($signature);
+        $objectTable    = $this->graphTable($meta, 'objects');
+        $snapshotTable  = $this->graphTable($meta, 'snapshots');
+        $classTable     = $this->graphTable($meta, 'classes');
+        $signatureTable = $this->graphTable($meta, 'signatures');
 
-        return new PersistedEntry(
-            Core::cast('zend_object *', $meta->find('root')->getRawPointer()),
-            Core::cast('char *', $meta->find('snapshot')->getRawPointer()),
-            $className,
-            $signature,
-        );
+        $objects    = [];
+        $snapshots  = [];
+        $classNames = [];
+        $signatures = [];
+        for ($index = 0; $index < $count; $index++) {
+            $classTable->findIndex($index)->getNativeValue($className);
+            $signatureTable->findIndex($index)->getNativeValue($signature);
+
+            $objects[]    = Core::cast('zend_object *', $objectTable->findIndex($index)->getRawPointer());
+            $snapshots[]  = Core::cast('char *', $snapshotTable->findIndex($index)->getRawPointer());
+            $classNames[] = $className;
+            $signatures[] = $signature;
+        }
+
+        return new PersistedEntry($objects, $snapshots, $classNames, $signatures);
+    }
+
+    /**
+     * Recovers one of the index-keyed per-graph tables of an entry
+     */
+    private function graphTable(PersistentHashTable $meta, string $key): PersistentHashTable
+    {
+        return PersistentHashTable::fromCData(Core::cast('HashTable *', $meta->find($key)->getRawPointer()));
     }
 
     /**
@@ -138,16 +182,16 @@ final class Registry
      * (an 8-byte pointer CData cannot be cast to a 16-byte zval), direct union-member
      * assignment can. The engine copies the temporary container into its bucket.
      */
-    private function addPointer(PersistentHashTable $table, string $key, CData $pointer): void
+    private function addPointer(PersistentHashTable $table, string|int $key, CData $pointer): void
     {
         $container                = Core::new('zval');
         $container->value->ptr    = Core::cast('void *', $pointer);
         $container->u1->type_info = ReflectionValue::IS_PTR;
 
-        $table->add($key, ReflectionValue::fromValueEntry(Core::addr($container)));
+        $this->addValue($table, $key, $container);
     }
 
-    private function addInternedString(PersistentHashTable $table, string $key, string $string): void
+    private function addInternedString(PersistentHashTable $table, string|int $key, string $string): void
     {
         $interned = StringEntry::persistentInterned($string);
 
@@ -156,6 +200,29 @@ final class Registry
         // Bare IS_STRING: interned payloads are stored without refcounting
         $container->u1->type_info = ReflectionValue::IS_STRING;
 
-        $table->add($key, ReflectionValue::fromValueEntry(Core::addr($container)));
+        $this->addValue($table, $key, $container);
+    }
+
+    private function addLong(PersistentHashTable $table, string|int $key, int $number): void
+    {
+        $container                = Core::new('zval');
+        $container->value->lval   = $number;
+        $container->u1->type_info = ReflectionValue::IS_LONG;
+
+        $this->addValue($table, $key, $container);
+    }
+
+    /**
+     * Stores a hand-built zval container under a string or integer key
+     */
+    private function addValue(PersistentHashTable $table, string|int $key, CData $container): void
+    {
+        $value = ReflectionValue::fromValueEntry(Core::addr($container));
+
+        if (\is_int($key)) {
+            $table->addIndex($key, $value);
+        } else {
+            $table->add($key, $value);
+        }
     }
 }

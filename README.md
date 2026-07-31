@@ -37,6 +37,9 @@ if (!$store->has(AppConfig::class)) {
 - 🧠 **Real objects, not copies** — the state lives in the engine's own
   persistent memory, the same trick PHP uses for interned strings; reads are
   zero-copy and mutations copy-on-write into request memory.
+- 🕸 **Whole object graphs** — persist a root and everything it references comes
+  along: nested objects, objects inside arrays, shared sub-objects (persisted
+  once, identity preserved) and cycles.
 - 🎯 **Typed API** — storage is keyed by `ClassName::class` with PHPStan generic
   templates, so `$store->get(AppConfig::class)` autocompletes as `AppConfig`.
 - 🛡 **Frozen by design** — request-time mutations roll back at shutdown; a
@@ -48,9 +51,10 @@ if (!$store->has(AppConfig::class)) {
   compile, nothing to install beyond Composer.
 
 The proof lives in CI: a FastCGI gate drives hundreds of *real* requests through
-one worker and asserts the object is built exactly once, survives every
-RINIT/RSHUTDOWN boundary, and sheds every mutation — plus a 5000-cycle soak that
-fails on a single leaked byte of request memory.
+one worker and asserts the object graph is built exactly once, survives every
+RINIT/RSHUTDOWN boundary with its cycles intact, and sheds every mutation — plus
+a 5000-cycle soak over a nested/diamond/cyclic graph that fails on a single
+leaked byte of request memory.
 
 Two features share one persistent module:
 
@@ -61,49 +65,60 @@ Two features share one persistent module:
 
 ## How it works
 
-`persist(ClassName::class, $object)` deep-converts the object's state into
-persistent (malloc) memory and returns a **new canonical instance**:
+`persist(ClassName::class, $object)` deep-converts the whole object **graph**
+reachable from that root into persistent (malloc) memory and returns a **new
+canonical root instance**:
 
-- the `zend_object` itself becomes a malloc-backed clone with its refcount
-  pinned high, flagged non-collectable (the cycle collector never scans it) and
-  with both shutdown passes over the object store suppressed;
+- every `zend_object` of the graph becomes a malloc-backed clone with its
+  refcount pinned high, flagged non-collectable (the cycle collector never scans
+  it) and with both shutdown passes over the object store suppressed;
+- **nested objects** are converted recursively and their slots retargeted at the
+  clones. The walk is keyed by the source object address, so an object reached
+  twice is persisted **once**: diamonds keep their shared identity, cycles
+  (including self-references) terminate instead of recursing;
 - **strings** become persistent interned strings living in non-refcounted zval
   slots — the engine shares the pointer and copy-on-writes on mutation, exactly
   like real interned strings;
 - **arrays** are rebuilt as sealed immutable persistent hashtables — reads are
-  zero-copy, writes copy-on-write into request memory;
+  zero-copy, writes copy-on-write into request memory; objects found inside them
+  join the graph as well;
 - scalars are plain byte copies.
 
-Per request the store re-registers each object in `EG(objects_store)` (fresh
-handle via `zend_objects_store_put`), rebinds the class entry by name with a
-layout-signature guard, and materializes the canonical PHP instance. At request
-shutdown — before the engine tears the object store down — every object is
-rolled back to its persisted snapshot and detached, so the engine never touches
-persistent memory with the request allocator.
+Per request the store re-registers **every** object of the graph in
+`EG(objects_store)` (fresh handle each via `zend_objects_store_put`), rebinds
+each object's class entry by name with a per-object layout-signature guard (a
+graph may mix classes), and materializes the canonical root instance — the rest
+of the graph is reached through property slots pointing at the very same pinned
+clones. At request shutdown — before the engine tears the object store down —
+every object is rolled back to its own persisted snapshot and detached, so the
+engine never touches persistent memory with the request allocator.
 
-### Frozen semantics (v1)
+### Frozen semantics
 
-Persisted state is **frozen**: you can mutate the object freely during a
-request (mutations land in request memory), but at request end every property
-is rolled back to the state captured by `persist()`. To change the persisted
-state, call `persist($name, $newObject)` again with fresh state. Mutation
-sync-back is planned as an opt-in mode.
+Persisted state is **frozen graph-wide**: you can mutate the root and any nested
+object freely during a request (mutations land in request memory), but at
+request end every property of every graph object is rolled back to the state
+captured by `persist()` — including slots you repointed at brand-new objects. To
+change the persisted state, call `persist($name, $newObject)` again with fresh
+state. Mutation sync-back is planned as an opt-in mode.
 
 ### What can be persisted
 
-Objects of **userland classes** with scalar, string and array properties
-(nested arrays welcome). The persister rejects — with the exact property path —
-anything whose identity or lifetime cannot outlive a request:
+Objects of **userland classes** with scalar, string, array and object properties
+(nested arrays and nested object graphs welcome). The persister rejects — with
+the exact property path, e.g. `$root::$services[db]::$pdo` — anything whose
+identity or lifetime cannot outlive a request:
 
 | Rejected | Why |
 |---|---|
-| Nested objects / closures | v1 limitation — flatten or persist separately |
 | Resources | tied to request-scoped handles |
-| References | v1 limitation |
-| Internal classes (`ArrayObject`, …) | carry C state the engine frees per request |
+| Closures | internal class carrying request-bound scope |
+| References | not supported yet |
+| Internal classes (`ArrayObject`, `stdClass`, …) | carry C state the engine frees per request |
 | Enums | enum case identity is per-request |
 | Dynamic properties | no stable slot to persist into |
 | Lazy objects / hooked classes | non-standard handlers or engine flags |
+| Objects from another persisted graph | graphs do not share objects — persist a single root |
 
 ### Deployment model
 
@@ -115,7 +130,13 @@ anything whose identity or lifetime cannot outlive a request:
   signature guards against class-shape drift; a changed class layout throws.
 - The instance returned by `persist()`/`get()` is the canonical one — existing
   references to the source object are not retargeted (zvals embed object
-  pointers directly; that is physics, not policy).
+  pointers directly; that is physics, not policy). The same holds for every
+  nested object: reach them through the returned root.
+- Two persisted graphs never share an object: wiring a clone from one `persist()`
+  call into another root is rejected. Persist one root instead.
+- The registry layout is versioned in the module globals; a worker still holding
+  a registry written by an older build is rejected on `boot()` instead of being
+  misread — restart the worker after upgrading.
 - `__destruct` never runs for persisted objects, `spl_object_id` changes per
   request, and an opcache restart invalidates permanently-interned string
   pointers shared with persisted state — restart workers together with opcache.
