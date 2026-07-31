@@ -40,6 +40,10 @@ if (!$store->has(AppConfig::class)) {
 - 🕸 **Whole object graphs** — persist a root and everything it references comes
   along: nested objects, objects inside arrays, shared sub-objects (persisted
   once, identity preserved) and cycles.
+- 🔗 **Shared across graphs** — a persisted object can join a second graph by
+  reference: `$a->child === $b->left` holds inside a request and across them.
+- 🧹 **Droppable** — `drop(ClassName::class)` removes an entry and hands the
+  memory of everything no other entry still references back to the process.
 - 🎯 **Typed API** — storage is keyed by `ClassName::class` with PHPStan generic
   templates, so `$store->get(AppConfig::class)` autocompletes as `AppConfig`.
 - 🛡 **Frozen by design** — request-time mutations roll back at shutdown; a
@@ -54,7 +58,9 @@ The proof lives in CI: a FastCGI gate drives hundreds of *real* requests through
 one worker and asserts the object graph is built exactly once, survives every
 RINIT/RSHUTDOWN boundary with its cycles intact, and sheds every mutation — plus
 a 5000-cycle soak over a nested/diamond/cyclic graph that fails on a single
-leaked byte of request memory.
+leaked byte of request memory, and a second 5000-cycle soak that persists and
+drops a whole graph per cycle and fails if the process does not get its memory
+back.
 
 Two features share one persistent module:
 
@@ -76,6 +82,8 @@ canonical root instance**:
   clones. The walk is keyed by the source object address, so an object reached
   twice is persisted **once**: diamonds keep their shared identity, cycles
   (including self-references) terminate instead of recursing;
+- objects that are **already persistent** are not converted at all — they join
+  the new graph by reference (see *Sharing objects between graphs* below);
 - **strings** become persistent interned strings living in non-refcounted zval
   slots — the engine shares the pointer and copy-on-writes on mutation, exactly
   like real interned strings;
@@ -84,14 +92,16 @@ canonical root instance**:
   join the graph as well;
 - scalars are plain byte copies.
 
-Per request the store re-registers **every** object of the graph in
-`EG(objects_store)` (fresh handle each via `zend_objects_store_put`), rebinds
-each object's class entry by name with a per-object layout-signature guard (a
-graph may mix classes), and materializes the canonical root instance — the rest
-of the graph is reached through property slots pointing at the very same pinned
-clones. At request shutdown — before the engine tears the object store down —
-every object is rolled back to its own persisted snapshot and detached, so the
-engine never touches persistent memory with the request allocator.
+Per request the store walks its **global object table once** and re-registers
+every persisted object in `EG(objects_store)` (fresh handle each via
+`zend_objects_store_put`), rebinds each object's class entry by name with a
+per-object layout-signature guard (a graph may mix classes), then materializes
+the canonical root instance of every entry — the rest of each graph is reached
+through property slots pointing at the very same pinned clones. An object shared
+by several entries is handled exactly once. At request shutdown — before the
+engine tears the object store down — every object is rolled back to its own
+persisted snapshot and detached, so the engine never touches persistent memory
+with the request allocator.
 
 ### Frozen semantics
 
@@ -118,7 +128,79 @@ identity or lifetime cannot outlive a request:
 | Enums | enum case identity is per-request |
 | Dynamic properties | no stable slot to persist into |
 | Lazy objects / hooked classes | non-standard handlers or engine flags |
-| Objects from another persisted graph | graphs do not share objects — persist a single root |
+| Persistent objects from a *foreign* registry | no record accounts for their lifetime (objects of **this** store are shared, not rejected) |
+
+### Sharing objects between graphs
+
+A persisted object is a **first-class value**: it can be stored in a plain
+request object's property, passed around, and wired into *another* graph you
+persist later. The persister recognizes it and references the existing clone
+instead of copying it.
+
+```php
+$a = $store->persist(Kernel::class, $kernel);       // graph A, includes $a->container
+$holder = new RequestScopedThing();
+$holder->container = $a->container;                 // first-class reference, perfectly safe
+
+$router = new Router();
+$router->container = $a->container;                 // reaches into graph A
+$b = $store->persist(Router::class, $router);       // graph B shares that object
+
+$b->container === $a->container;                    // true, in this request and every later one
+```
+
+Every persistent object counts how many **entries** reference it (`shares`).
+`persist()` increments the count of every member of the new graph *before* the
+previous generation of that key is released, so an object present in both never
+transits through zero. The same root can also be filed under several keys — two
+entries, one fully shared graph.
+
+Foreign persistent objects — clones minted by a different registry, e.g. another
+module instance — are still rejected: nothing here can account for their
+lifetime.
+
+### Dropping persisted entries
+
+```php
+$store->drop(AppConfig::class);   // true if an entry was removed, false if there was none
+```
+
+`drop()` removes the entry and gives the process its memory back: for every
+member no other entry still references, it frees the object clone, its frozen
+snapshot buffer, every sealed array hashtable it owns (nested arrays included)
+and all of the registry bookkeeping around it. Shared members survive with their
+share count decremented. Persisting over an existing key is the same operation
+with a new graph put in place first, so a long-running worker that re-persists a
+key does not accumulate generations.
+
+**Alias safety.** Userland copies of an object zval bump the refcount even on a
+pinned persistent clone, so a live alias is detectable. If anything in the
+current request still holds an object that `drop()` would free, it throws a
+`RuntimeException` naming the class and changes nothing at all — release the
+references (`unset()` them, or let their scope end) and drop again:
+
+```php
+$config = $store->get(AppConfig::class);
+$store->drop(AppConfig::class);   // RuntimeException: the request still holds ...
+unset($config);
+$store->drop(AppConfig::class);   // true
+```
+
+**Array and string payloads are NOT covered by that check.** Immutable arrays and
+persistent strings live in *non-refcounted* zvals — that is what makes them
+zero-copy to read — so a copy taken earlier in the same request leaves no trace
+behind. After `drop()` returns, do not use copies of that entry's array or string
+values taken earlier in the same request. Across requests the question cannot
+arise: request memory dies with its request.
+
+**What is not reclaimed.** Persistent strings (property values, array keys and
+elements, class names, registry keys) are deliberately never freed, for exactly
+the reason above: nothing can prove a request-side copy is gone. They are also
+not deduplicated, so the leak is proportional to the number of strings persisted
+over the process lifetime — roughly 4 kB per persist/drop cycle of a five-object
+graph in `tools/soak-drop.php`, against ~13 kB per cycle if nothing were
+reclaimed. A real content-keyed persistent intern table would remove this
+residue; it is the next iteration.
 
 ### Deployment model
 
@@ -132,8 +214,10 @@ identity or lifetime cannot outlive a request:
   references to the source object are not retargeted (zvals embed object
   pointers directly; that is physics, not policy). The same holds for every
   nested object: reach them through the returned root.
-- Two persisted graphs never share an object: wiring a clone from one `persist()`
-  call into another root is rejected. Persist one root instead.
+- Persisted graphs **may** share objects: wiring a clone from one `persist()`
+  call into another root references it instead of copying it. Each object counts
+  how many entries reference it, and only objects nobody references anymore are
+  freed by `drop()`.
 - The registry layout is versioned in the module globals; a worker still holding
   a registry written by an older build is rejected on `boot()` instead of being
   misread — restart the worker after upgrading.
@@ -143,10 +227,12 @@ identity or lifetime cannot outlive a request:
 
 ### Introspection
 
-The module surfaces its state in `phpinfo()` / `php -i` (persisted object count and
-names in the `shared_objects` section) and declares an engine-enforced dependency on
-`ext-ffi`. At request end a module-level `requestShutdown()` callback acts as a
-belt-and-braces detach on top of the store's own shutdown function.
+The module surfaces its state in `phpinfo()` / `php -i` (persisted entry names,
+entry count and the number of live object clones in the `shared_objects`
+section; `PersistentStore::objectCount()` returns the same number) and declares
+an engine-enforced dependency on `ext-ffi`. At request end a module-level
+`requestShutdown()` callback acts as a belt-and-braces detach on top of the
+store's own shutdown function.
 
 ## API
 
@@ -156,6 +242,8 @@ $store->persist(User::class, $o): User;    // convert + return canonical instanc
 $store->attach(): array;                   // class-string => instance for this request (idempotent)
 $store->get(User::class): ?User;           // canonical instance or null
 $store->has(User::class): bool;
+$store->drop(User::class): bool;           // remove the entry + reclaim what nobody shares
+$store->objectCount(): int;                // live persistent clones (shared ones counted once)
 $store->detach(): void;                    // runs automatically at request shutdown
 ```
 
@@ -165,6 +253,7 @@ $store->detach(): void;                    // runs automatically at request shut
 composer install
 vendor/bin/phpunit                       # unit + lifecycle tests
 php -d ffi.enable=1 tools/soak.php       # 5k attach/mutate/detach cycles, flat-memory gate
+php -d ffi.enable=1 tools/soak-drop.php  # 5k persist/attach/drop cycles, reclamation gate
 bash tools/request-boundary/run.sh 100   # real RINIT/RSHUTDOWN boundaries via php-cgi/FastCGI
 php -d ffi.enable=1 demos/demo-objects.php
 php -d ffi.enable=1 demo.php             # original shared C data demo
@@ -175,5 +264,8 @@ CI runs all of the above on every push and pull request.
 ## Requirements
 
 - PHP ~8.4 (NTS) with `ext-ffi`
-- `lisachenko/z-engine` `dev-master` (or the `8.4` release line once tagged —
-  z-engine versions follow the PHP version they target)
+- `lisachenko/z-engine` — temporarily pinned to the
+  `claude/shared-objects-dag-memory-nq462w` branch, which adds the persistent
+  free primitives (`Core::persistentFree()`, `PersistentHashTable::destroy()`,
+  `HashTable::deleteIndex()`) this release needs; back to `dev-master` (or the
+  `8.4` release line once tagged) as soon as that lands

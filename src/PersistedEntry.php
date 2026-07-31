@@ -18,36 +18,41 @@ use FFI\CData;
 /**
  * One persisted object GRAPH as tracked by the registry
  *
- * A graph is stored as parallel per-index lists in discovery order; index 0 is always
- * the root - the object persist()/get() hands back. Every other index is an object
- * reachable from the root through property slots (directly or through arrays), each
- * with its own snapshot, class name and layout signature: a graph may mix classes.
+ * An entry is a NAMED VIEW over the registry's global object table: it owns nothing but a
+ * list of member addresses in discovery order, index 0 being the root - the object
+ * persist()/get() hands back. Every other member is an object reachable from the root
+ * through property slots (directly or through arrays).
  *
- * All CData here points into persistent (malloc) memory and stays valid across
- * requests; only the class-entry binding of each object must be refreshed per request.
+ * Since layout v3 a member may be shared with other entries (see Persister): the objects
+ * themselves are described once, in PersistedObject records, and entries only reference
+ * them. That indirection is what makes both cross-graph sharing and safe drop() possible -
+ * removing an entry decrements its members' share counts, and only objects that no entry
+ * references anymore are actually reclaimed.
  */
 final class PersistedEntry
 {
     /**
-     * @param list<CData>  $objects    zend_object* of every persistent clone, root first
-     * @param list<CData>  $snapshots  char* snapshot of each object's properties_table (frozen state)
-     * @param list<string> $classNames Fully-qualified class name per object, for per-request ce rebinding
-     * @param list<string> $signatures Layout signature per object, guarding against class-shape drift
+     * @param list<int>            $members      Addresses of every member object, root first
+     * @param list<PersistedObject> $created     Objects MINTED by the persist() call that produced
+     *                                           this entry (empty for a hydrated entry); shared
+     *                                           members are absent - they are already registered
+     * @param CData|null           $metaTable    HashTable* of the persisted entry record (hydrated only)
+     * @param CData|null           $membersTable HashTable* of the member list (hydrated only)
      */
     public function __construct(
-        public array $objects,
-        public array $snapshots,
-        public array $classNames,
-        public array $signatures,
+        public array $members,
+        public array $created = [],
+        public ?CData $metaTable = null,
+        public ?CData $membersTable = null,
     ) {
     }
 
     /**
-     * Returns the zend_object* of the graph root
+     * Returns the address of the graph root
      */
-    public function root(): CData
+    public function root(): int
     {
-        return $this->objects[0];
+        return $this->members[0];
     }
 
     /**
@@ -55,6 +60,6 @@ final class PersistedEntry
      */
     public function count(): int
     {
-        return \count($this->objects);
+        return \count($this->members);
     }
 }
