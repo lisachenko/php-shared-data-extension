@@ -27,18 +27,21 @@ use ZEngine\Type\PersistentObjectFactory;
  *   1. Core::init() / Core::preload() (z-engine)
  *   2. $store = PersistentStore::boot()   - registers/reattaches the persistent module,
  *      recovers the registry from module globals and verifies its layout version
- *   3. $objects = $store->attach()        - re-registers EVERY object of every persisted
- *      graph in this request's object store (fresh handle each), rebinds their class
- *      entries and returns the graph roots; also arms detach() as a shutdown function
- *   4. ... use the objects; persist() new ones at any time ...
+ *   3. $objects = $store->attach()        - re-registers EVERY persisted object in this
+ *      request's object store (fresh handle each), rebinds their class entries and
+ *      returns the graph roots; also arms detach() as a shutdown function
+ *   4. ... use the objects; persist() new ones or drop() old ones at any time ...
  *   5. detach() runs automatically at request shutdown BEFORE the engine destroys the
- *      object store: rolls every graph object's properties back to its persisted snapshot
+ *      object store: rolls every persisted object's properties back to its snapshot
  *      (frozen semantics), releases request-owned caches and hides the objects from
  *      teardown.
  *
- * A persisted entry is a whole object GRAPH (see Persister): the store keys instances by
- * the graph root, nested objects are reached through the root's properties and keep their
- * identity across requests.
+ * A persisted entry is a whole object GRAPH (see Persister), keyed by a class-string. The
+ * graph is described as a list of MEMBER objects living in one process-wide object table,
+ * so entries may share members: persisting an object that already belongs to another entry
+ * references the existing clone instead of copying it, and identity holds across entries
+ * and across requests. Every object counts how many entries reference it, which is what
+ * lets drop() reclaim memory without ever pulling an object out from under a live graph.
  *
  * persist() returns a NEW canonical persistent instance: zvals embed zend_object
  * pointers directly, so existing references to the source object cannot be retargeted.
@@ -62,10 +65,12 @@ final class PersistentStore
     private array $instances = [];
 
     /**
-     * Object-store handles held during this request: one per object of each persisted
-     * graph, in graph index order
+     * Object-store handles held during this request, keyed by persistent clone ADDRESS
      *
-     * @var array<class-string, list<int>>
+     * Keying by address rather than by entry is what keeps a shared object registered
+     * exactly once per request, no matter how many entries reach it.
+     *
+     * @var array<int, int>
      */
     private array $handles = [];
 
@@ -137,12 +142,19 @@ final class PersistentStore
      *
      * Every object reachable from $object through property slots (directly or through
      * arrays) is persisted with it, exactly once, so shared sub-objects keep their
-     * identity and cycles are fine.
+     * identity and cycles are fine. Objects that are ALREADY persistent in this store
+     * are referenced rather than copied: a graph may reach into another entry's graph,
+     * and both entries then own the shared objects jointly.
      *
      * Storage is keyed by class (or interface) name, so static analyzers infer the
      * instance type from the key: `$store->get(AppConfig::class)` is an AppConfig. The
      * instance is immediately live for the current request; on later requests it is
      * re-materialized by attach() under the same key.
+     *
+     * Persisting over an existing key is an upsert: the previous graph is released with
+     * exactly the same accounting as drop(), including the alias-safety check - so a
+     * request that still holds instances of objects only the previous graph referenced
+     * gets a RuntimeException instead of freed memory under its feet.
      *
      * @template T of object
      *
@@ -162,15 +174,76 @@ final class PersistentStore
         }
         $this->attach();
 
-        $entry = $this->persister->persistObject($object);
+        $entry = $this->persister->persistObject(
+            $object,
+            fn (int $address): ?PersistedObject => $this->registry->findObject($address),
+        );
+
+        // Hydrated BEFORE the upsert overwrites the record, and released AFTER the new
+        // members were share-incremented: an object belonging to both generations must
+        // never transit through a share count of zero. Members the new graph keeps
+        // referencing are protected, so only the truly superseded ones are candidates
+        $previous   = $this->registry->findEntry($className);
+        $candidates = [];
+        if ($previous !== null) {
+            $candidates = $this->guardedCandidates($className, $previous, $entry->members);
+        }
+
         $this->registry->store($className, $entry);
+
+        if ($previous !== null) {
+            // The name already points at the new record - only the superseded generation
+            // has to be released, never the key itself
+            $this->releaseEntry($className, $previous, $candidates, false);
+        }
 
         /** @var T */
         return $this->materialize($className, $entry);
     }
 
     /**
-     * Re-registers every object of every persisted graph for the current request
+     * Removes a persisted graph and reclaims every object no other entry still references
+     *
+     * Returns false when nothing is stored under $className - dropping what is not there
+     * is not an error. Objects shared with other entries survive with their share count
+     * decremented; only members that no entry references anymore are freed (their sealed
+     * arrays, snapshot buffers, clone blocks and metadata tables all go back to the
+     * process allocator - see Reclaimer for what is deliberately kept).
+     *
+     * Alias safety: an object may only be freed while nothing in this request can still
+     * reach it. Userland copies of an object zval addref even a pinned persistent clone,
+     * so a live alias is detectable - if any object about to be freed sits above the pin
+     * baseline, this throws a RuntimeException and leaves the registry completely intact
+     * (the check runs before any mutation). Release your references, then drop again.
+     *
+     * ARRAY payloads cannot be checked this way: immutable arrays live in non-refcounted
+     * zvals, so a copy taken earlier in this request leaves no trace. Copies of a dropped
+     * entry's arrays must not be used after drop() returns; across requests the question
+     * cannot arise, since request memory dies with its request.
+     *
+     * @param class-string $className Storage key of the graph to remove
+     *
+     * @return bool Whether an entry was actually removed
+     */
+    public function drop(string $className): bool
+    {
+        // Attach first so handle state is consistent no matter when drop() is called
+        $this->attach();
+
+        $entry = $this->registry->findEntry($className);
+        if ($entry === null) {
+            return false;
+        }
+
+        $candidates = $this->guardedCandidates($className, $entry, []);
+
+        $this->releaseEntry($className, $entry, $candidates, true);
+
+        return true;
+    }
+
+    /**
+     * Re-registers every persisted object for the current request
      *
      * @return array<class-string, object> class-string key => canonical graph root
      */
@@ -178,10 +251,18 @@ final class PersistentStore
     {
         if (!$this->attached) {
             $this->attached = true;
-            foreach ($this->registry->all() as $className => $entry) {
-                $this->rebindClassEntries($entry);
-                $this->materialize($className, $entry);
+
+            // ONE pass over the global object table: a shared object is rebound, registered
+            // and pinned exactly once, however many entries reach it
+            foreach ($this->registry->allObjects() as $address => $object) {
+                $this->rebindClassEntry($object);
+                $this->register($address, $object->object);
             }
+
+            foreach ($this->registry->allEntries() as $className => $entry) {
+                $this->instances[$className] = self::instanceOf($this->rootObjectOf($entry));
+            }
+
             $this->armShutdown();
         }
 
@@ -214,9 +295,20 @@ final class PersistentStore
     }
 
     /**
-     * Detaches every persisted graph from the current request
+     * Number of persistent object clones currently held by the registry
      *
-     * For every object of every graph: rolls property mutations back to the persisted
+     * Shared objects are counted once. Useful as a reclamation gauge in tests and worker
+     * diagnostics; the same number is shown in the module's phpinfo() section.
+     */
+    public function objectCount(): int
+    {
+        return $this->registry->objectCount();
+    }
+
+    /**
+     * Detaches every persisted object from the current request
+     *
+     * For every persisted object: rolls property mutations back to the persisted
      * snapshot, releases the lazily rebuilt dynamic-properties table, restores the
      * refcount pin and hides the object from the object-store teardown. Runs
      * automatically as a shutdown function; public so worker loops and tests can cycle
@@ -231,36 +323,32 @@ final class PersistentStore
         // Drop our own references first so only foreign references remain in the count
         $this->instances = [];
 
-        /** @var array<string, PersistedEntry> $entries */
-        $entries = iterator_to_array($this->registry->all());
+        /** @var list<PersistedObject> $objects */
+        $objects = iterator_to_array($this->registry->allObjects(), false);
 
-        foreach ($entries as $entry) {
-            foreach ($entry->objects as $index => $object) {
-                $this->restoreSnapshot($object, $entry->snapshots[$index]);
+        foreach ($objects as $object) {
+            $this->restoreSnapshot($object->object, $object->snapshot);
 
-                $objectEntry = ObjectEntry::fromCData($object);
+            $objectEntry = ObjectEntry::fromCData($object->object);
 
-                // Release the request-allocated properties hashtable rebuilt by
-                // get_object_vars()/var_dump()/casts, it would dangle next request
-                $dynamicProperties = $objectEntry->getDynamicPropertiesPointer();
-                if ($dynamicProperties !== null) {
-                    (new HashTable($dynamicProperties))->releaseReference();
-                    $objectEntry->setDynamicPropertiesPointer(null);
-                }
+            // Release the request-allocated properties hashtable rebuilt by
+            // get_object_vars()/var_dump()/casts, it would dangle next request
+            $dynamicProperties = $objectEntry->getDynamicPropertiesPointer();
+            if ($dynamicProperties !== null) {
+                (new HashTable($dynamicProperties))->releaseReference();
+                $objectEntry->setDynamicPropertiesPointer(null);
             }
         }
 
         // Pins are re-baselined only after EVERY rollback is done: a slot the request
         // pointed at another persistent object is released above, which decrements that
         // object's pin - possibly one that was already processed in this same pass
-        foreach ($entries as $name => $entry) {
-            foreach ($entry->objects as $object) {
-                $object->gc->refcount = PersistentObjectFactory::PIN_BASELINE;
-            }
+        foreach ($objects as $object) {
+            $object->object->gc->refcount = PersistentObjectFactory::PIN_BASELINE;
+        }
 
-            foreach ($this->handles[$name] ?? [] as $handle) {
-                Core::$executor->objectStore->recycle($handle);
-            }
+        foreach ($this->handles as $handle) {
+            Core::$executor->objectStore->recycle($handle);
         }
 
         $this->handles  = [];
@@ -268,62 +356,186 @@ final class PersistentStore
     }
 
     /**
-     * Registers every graph object for this request and caches the canonical root instance
+     * Determines what releasing $entry would free, and refuses if the request can still see it
      *
-     * Nested objects need their own object-store handle (spl_object_id, GC and every
-     * engine path that resolves an object by handle depend on it), but only the root is
-     * materialized as a PHP instance - the rest is reached through property slots, which
-     * point at the very same pinned clones.
+     * Runs BEFORE any registry state is touched, and gives back a store that is exactly as
+     * it was if it refuses: the store's own cached root instance is released first (it is
+     * bookkeeping, not a user alias, and would otherwise mask every honest count) and
+     * re-materialized from the untouched entry when the check fails.
+     *
+     * @param list<int> $protected Member addresses a NEW generation of this entry keeps
+     *                             referencing; those can never reach a share count of zero
+     *
+     * @return list<PersistedObject> Members that releasing this entry would reclaim
+     */
+    private function guardedCandidates(string $className, PersistedEntry $entry, array $protected): array
+    {
+        $hadInstance = isset($this->instances[$className]);
+        unset($this->instances[$className]);
+
+        // A member whose last referencing entry is this one, and which no successor keeps
+        $candidates = [];
+        foreach ($entry->members as $address) {
+            $object = $this->registry->findObject($address);
+            if ($object !== null && $object->shares <= 1 && !\in_array($address, $protected, true)) {
+                $candidates[] = $object;
+            }
+        }
+
+        foreach ($candidates as $candidate) {
+            // Userland copies of an object zval addref even a pinned persistent clone, so
+            // anything off the baseline means the request can still reach this object
+            if ($candidate->object->gc->refcount === PersistentObjectFactory::PIN_BASELINE) {
+                continue;
+            }
+            if ($hadInstance) {
+                $this->instances[$className] = self::instanceOf($this->rootObjectOf($entry));
+            }
+
+            throw new \RuntimeException(sprintf(
+                'Cannot release %s: the request still holds a reference to the persisted %s instance ' .
+                'that would be freed. Release every variable, property and array element pointing at ' .
+                'the graph (unset() them, or let their scope end) before dropping or replacing the entry.',
+                $className,
+                $candidate->className,
+            ));
+        }
+
+        return $candidates;
+    }
+
+    /**
+     * Removes one entry, decrements its members' shares and reclaims what nobody needs
+     *
+     * Called only with the candidate list guardedCandidates() has already vetted, so
+     * nothing below this line can fail on user state.
+     *
+     * @param list<PersistedObject> $candidates Members to reclaim once their share hits zero
+     * @param bool                  $unlink     Whether the NAME still points at this entry
+     *                                          (false for the superseded half of an upsert)
+     */
+    private function releaseEntry(string $className, PersistedEntry $entry, array $candidates, bool $unlink): void
+    {
+        // A bucket pointing at a freed clone would be walked at request shutdown
+        foreach ($candidates as $candidate) {
+            $this->unregister($candidate->address);
+        }
+
+        if ($unlink) {
+            $this->registry->removeEntry($className, $entry);
+        } else {
+            $this->registry->discardEntry($entry);
+        }
+
+        foreach ($entry->members as $address) {
+            $member = $this->registry->findObject($address);
+            if ($member !== null && $this->registry->adjustShares($address, -1) === 0) {
+                $this->registry->removeObject($member);
+            }
+        }
+    }
+
+    /**
+     * Registers every member of a freshly persisted graph and caches its root instance
+     *
+     * Members that already hold a handle this request are skipped: attach() registered
+     * them, or they are shared with an entry that did. Re-registering would leak an
+     * object-store slot and re-pinning would clobber a live alias's refcount.
      */
     private function materialize(string $name, PersistedEntry $entry): object
     {
-        $handles = [];
-        foreach ($entry->objects as $object) {
-            $handles[]            = Core::$executor->objectStore->put($object);
-            $object->gc->refcount = PersistentObjectFactory::PIN_BASELINE;
+        foreach ($entry->members as $address) {
+            if (isset($this->handles[$address])) {
+                continue;
+            }
+            $object = $this->registry->findObject($address);
+            \assert($object !== null);
+
+            $this->register($address, $object->object);
         }
-        $this->handles[$name] = $handles;
 
-        $value = ReflectionValue::newEntry(ReflectionValue::IS_OBJECT, $entry->root()[0]);
-        $value->getNativeValue($instance);
-        $value->release();
-
+        $instance               = self::instanceOf($this->rootObjectOf($entry));
         $this->instances[$name] = $instance;
 
         return $instance;
     }
 
     /**
-     * Rebinds every graph object to this request's class entry, guarding layout drift
+     * Gives one persistent clone a fresh object-store handle for this request
      */
-    private function rebindClassEntries(PersistedEntry $entry): void
+    private function register(int $address, CData $object): void
     {
-        foreach ($entry->objects as $index => $object) {
-            $className  = $entry->classNames[$index];
-            $classValue = Core::$executor->classTable->find(strtolower($className));
-            if ($classValue === null) {
-                throw new \RuntimeException(
-                    "Class {$className} is not loaded; load or preload it before attach()",
-                );
-            }
-            $classEntry = $classValue->getRawClass();
+        $this->handles[$address] = Core::$executor->objectStore->put($object);
+        $object->gc->refcount    = PersistentObjectFactory::PIN_BASELINE;
+    }
 
-            $signature = Persister::computeSignature($classEntry);
-            if ($signature !== $entry->signatures[$index]) {
-                throw new \RuntimeException(
-                    "Class {$className} changed its property layout since the object was persisted; " .
-                    'drop the persisted entry or restart the worker',
-                );
-            }
-
-            $object->ce = $classEntry;
+    /**
+     * Returns an object's request handle to the store's free list (no-op if unregistered)
+     *
+     * Called before the clone is freed: a bucket still pointing at released memory would
+     * be walked by the engine at request shutdown.
+     */
+    private function unregister(int $address): void
+    {
+        if (isset($this->handles[$address])) {
+            Core::$executor->objectStore->recycle($this->handles[$address]);
+            unset($this->handles[$address]);
         }
     }
 
     /**
-     * Rolls the inline property slots of one graph object back to its frozen snapshot
+     * Resolves the zend_object* of an entry's root member
+     */
+    private function rootObjectOf(PersistedEntry $entry): CData
+    {
+        $root = $this->registry->findObject($entry->root());
+        if ($root === null) {
+            throw new \RuntimeException('Persistent registry is inconsistent: an entry lost its root object');
+        }
+
+        return $root->object;
+    }
+
+    /**
+     * Materializes the PHP instance of a persistent clone (+1 ref held by the return value)
+     */
+    private static function instanceOf(CData $object): object
+    {
+        $value = ReflectionValue::newEntry(ReflectionValue::IS_OBJECT, $object[0]);
+        $value->getNativeValue($instance);
+        $value->release();
+
+        return $instance;
+    }
+
+    /**
+     * Rebinds one persisted object to this request's class entry, guarding layout drift
+     */
+    private function rebindClassEntry(PersistedObject $object): void
+    {
+        $classValue = Core::$executor->classTable->find(strtolower($object->className));
+        if ($classValue === null) {
+            throw new \RuntimeException(
+                "Class {$object->className} is not loaded; load or preload it before attach()",
+            );
+        }
+        $classEntry = $classValue->getRawClass();
+
+        $signature = Persister::computeSignature($classEntry);
+        if ($signature !== $object->signature) {
+            throw new \RuntimeException(
+                "Class {$object->className} changed its property layout since the object was persisted; " .
+                'drop the persisted entry or restart the worker',
+            );
+        }
+
+        $object->object->ce = $classEntry;
+    }
+
+    /**
+     * Rolls the inline property slots of one persisted object back to its frozen snapshot
      *
-     * A persisted slot is refcounted only when it points at another graph object, so
+     * A persisted slot is refcounted only when it points at another persistent object, so
      * "refcounted" no longer implies "mutated by the request". The honest test is a
      * comparison against the frozen image: a slot whose payload word or type_info drifted
      * holds a request-time value and must be released before the frozen bytes come back.
@@ -336,9 +548,9 @@ final class PersistentStore
         if ($count === 0) {
             return;
         }
-        $zvalSize     = Core::sizeof(Core::type('zval'));
-        $tableBase    = Core::cast('zval *', Core::addr($object->properties_table[0]));
-        $frozen       = Core::cast('zval *', $snapshot);
+        $zvalSize       = Core::sizeof(Core::type('zval'));
+        $tableBase      = Core::cast('zval *', Core::addr($object->properties_table[0]));
+        $frozen         = Core::cast('zval *', $snapshot);
         $refcountedFlag = 1 << Core::engineConstant('Z_TYPE_FLAGS_SHIFT');
 
         for ($index = 0; $index < $count; $index++) {

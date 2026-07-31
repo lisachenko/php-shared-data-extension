@@ -51,6 +51,25 @@ jobs:
       - name: Soak
         run: php -d ffi.enable=1 tools/soak.php 5000
 
+  soak-drop:
+    name: Reclaiming soak (5k persist/drop cycles)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: ffi
+          ini-values: ffi.enable=1, opcache.jit=off
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress
+
+      - name: Dropped graphs give their memory back
+        run: php -d ffi.enable=1 tools/soak-drop.php 5000
+
   request-boundary:
     name: True multi-request gate (php-cgi/FastCGI)
     runs-on: ubuntu-latest

@@ -16,6 +16,8 @@ namespace Lisachenko\SharedData;
 use Lisachenko\SharedData\Stub\GraphNode;
 use Lisachenko\SharedData\Stub\ServiceHolder;
 use PHPUnit\Framework\TestCase;
+use ZEngine\Reflection\ReflectionValue;
+use ZEngine\Type\PersistentObjectFactory;
 
 /**
  * Deep conversion of object graphs: nesting, diamonds, cycles and their rejection paths
@@ -285,16 +287,52 @@ class PersistentGraphTest extends TestCase
         $this->store->persist(GraphNode::class, $source);
     }
 
-    public function testAlreadyPersistentObjectCanNotJoinAnotherGraph(): void
+    public function testAlreadyPersistentObjectJoinsTheNewGraphByReference(): void
     {
-        $persisted = $this->store->persist(GraphNode::class, new GraphNode('first-graph'));
+        $persisted          = $this->store->persist(GraphNode::class, new GraphNode('first-graph'));
+        $persisted->counter = 0;
 
         $second       = new GraphNode('second-graph');
         $second->left = $persisted;
 
-        $this->expectException(NotPersistableException::class);
-        $this->expectExceptionMessageMatches('/\$root::\$left.*already persistent.*cross-graph sharing/');
-        $this->store->persist(GraphNode::class, $second);
+        // Re-persisting under the SAME key: the new graph reaches into the old one, so the
+        // old root survives the upsert as a shared member instead of being rejected
+        $root = $this->store->persist(GraphNode::class, $second);
+
+        $this->assertSame('second-graph', $root->name);
+        $this->assertSame($persisted, $root->left);
+        $this->assertSame('first-graph', $root->left->name);
+
+        $this->store->detach();
+        $restored = $this->store->attach()[GraphNode::class];
+        $this->assertSame('first-graph', $restored->left->name);
+    }
+
+    public function testForeignPersistentObjectIsRejected(): void
+    {
+        // A persistent clone minted outside the store: it looks persistent but no registry
+        // record accounts for its lifetime, so it can never join a persisted graph
+        $stranger      = new GraphNode('stranger');
+        $strangerValue = new ReflectionValue($stranger);
+        $foreign       = PersistentObjectFactory::persistentClone($strangerValue->getRawObject());
+        $strangerValue->release();
+
+        $value = ReflectionValue::newEntry(ReflectionValue::IS_OBJECT, $foreign[0]);
+        $value->getNativeValue($instance);
+        $value->release();
+
+        $source       = new GraphNode('root');
+        $source->left = $instance;
+
+        try {
+            $this->expectException(NotPersistableException::class);
+            $this->expectExceptionMessageMatches('/\$root::\$left.*not registered in this store/');
+            $this->store->persist(GraphNode::class, $source);
+        } finally {
+            // The engine must not see the unregistered clone at teardown
+            $source->left = null;
+            unset($instance);
+        }
     }
 
     public function testNestedObjectWithDynamicPropertyIsRejectedWithItsPath(): void

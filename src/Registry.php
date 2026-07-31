@@ -20,35 +20,59 @@ use ZEngine\Type\PersistentHashTable;
 use ZEngine\Type\StringEntry;
 
 /**
- * Persistent name => object graph metadata store, anchored in the module globals
+ * Persistent registry of named object graphs, anchored in the module globals
  *
- * Layout v2 (everything in persistent memory, valid across requests):
+ * Layout v3 (everything in persistent memory, valid across requests):
  *
- *   root table:  name (interned) => IS_PTR to a per-entry metadata table
- *   entry table: 'count'      => IS_LONG number of objects in the persisted graph
- *                'objects'    => IS_PTR  to a graph table: index => IS_PTR zend_object*
- *                'snapshots'  => IS_PTR  to a graph table: index => IS_PTR char*
- *                'classes'    => IS_PTR  to a graph table: index => IS_STRING class name
- *                'signatures' => IS_PTR  to a graph table: index => IS_STRING signature
+ *   root table:   'entries' => IS_PTR  entry table:  name (interned) => IS_PTR entry record
+ *                 'objects' => IS_PTR  object table: clone address (int key) => IS_PTR object record
  *
- * The four graph tables are index-keyed and parallel: index 0 is the graph root (the
- * object handed back by persist()/get()), every other index is an object reachable from
- * it. Layout v1 stored a single object per entry ('root'/'snapshot'/'class'/'signature');
- * the module globals carry LAYOUT_VERSION so a worker that still holds a v1 registry is
- * rejected instead of misread - see PersistentStore::boot().
+ *   entry record:  'count'     => IS_LONG   number of member objects
+ *                  'members'   => IS_PTR    index => IS_LONG member address, index 0 = root
  *
- * The root, entry and graph tables stay mutable (they are registries, not user data);
- * only converted user payloads are sealed immutable by the Persister.
+ *   object record: 'object'    => IS_PTR    zend_object* clone
+ *                  'snapshot'  => IS_PTR    char* frozen properties_table image
+ *                  'class'     => IS_STRING interned class name
+ *                  'signature' => IS_STRING interned layout signature
+ *                  'shares'    => IS_LONG   number of entries referencing this object
+ *                  'arrays'    => IS_PTR    index => IS_PTR sealed array HashTable*
+ *                                           (allocation list owned by this object)
+ *
+ * The split between entries and objects is what v3 is about. Layout v2 stored the whole
+ * graph inside its entry (parallel index-keyed tables of objects, snapshots, classes and
+ * signatures), which made an object the exclusive property of one entry. Objects now live
+ * in ONE process-wide table keyed by the clone's own address, so:
+ *
+ *  - the persister can look an already-persistent object up and REFERENCE it instead of
+ *    rejecting it (cross-graph sharing, see Persister);
+ *  - attach() re-registers every persisted object exactly once per request, no matter how
+ *    many entries reach it;
+ *  - 'shares' tracks how many entries a given object belongs to, which is what makes
+ *    drop() able to free memory without ever pulling an object out from under a graph
+ *    that still needs it.
+ *
+ * Layout v1 stored a single object per entry. The module globals carry LAYOUT_VERSION, so
+ * a worker still holding a v1/v2 registry is rejected instead of misread - see
+ * PersistentStore::boot().
+ *
+ * All registry tables stay mutable (they are bookkeeping, not user data); only converted
+ * user payloads are sealed immutable by the Persister.
  */
 final class Registry
 {
     /**
      * Version tag of the persistent layout described above, stored in module globals[1]
      */
-    public const LAYOUT_VERSION = 2;
+    public const LAYOUT_VERSION = 3;
 
-    public function __construct(private PersistentHashTable $root)
+    private PersistentHashTable $entries;
+
+    private PersistentHashTable $objects;
+
+    private function __construct(private PersistentHashTable $root)
     {
+        $this->entries = self::tableAt($root, 'entries');
+        $this->objects = self::tableAt($root, 'objects');
     }
 
     /**
@@ -74,107 +98,254 @@ final class Registry
     public static function create(): array
     {
         $root = PersistentHashTable::create();
+        self::addPointer($root, 'entries', PersistentHashTable::create()->getRawValue());
+        self::addPointer($root, 'objects', PersistentHashTable::create()->getRawValue());
 
         return [new self($root), Core::addressOf($root->getRawValue())];
     }
 
+    /**
+     * Registers a freshly persisted graph under $name, sharing what is already persisted
+     *
+     * Order matters: the new entry's members are share-incremented BEFORE the caller
+     * releases whatever entry lived under this name before, so an object belonging to both
+     * generations never transits through a share count of zero (and is therefore never
+     * reclaimed and immediately re-created).
+     */
     public function store(string $name, PersistedEntry $entry): void
     {
-        $objects    = PersistentHashTable::create();
-        $snapshots  = PersistentHashTable::create();
-        $classes    = PersistentHashTable::create();
-        $signatures = PersistentHashTable::create();
+        foreach ($entry->created as $object) {
+            $this->addObject($object);
+        }
+        foreach ($entry->members as $address) {
+            $this->adjustShares($address, +1);
+        }
 
-        foreach ($entry->objects as $index => $object) {
-            $this->addPointer($objects, $index, $object);
-            $this->addPointer($snapshots, $index, $entry->snapshots[$index]);
-            $this->addInternedString($classes, $index, $entry->classNames[$index]);
-            $this->addInternedString($signatures, $index, $entry->signatures[$index]);
+        $members = PersistentHashTable::create();
+        foreach ($entry->members as $index => $address) {
+            self::addLong($members, $index, $address);
         }
 
         $meta = PersistentHashTable::create();
-        $this->addLong($meta, 'count', $entry->count());
-        $this->addPointer($meta, 'objects', $objects->getRawValue());
-        $this->addPointer($meta, 'snapshots', $snapshots->getRawValue());
-        $this->addPointer($meta, 'classes', $classes->getRawValue());
-        $this->addPointer($meta, 'signatures', $signatures->getRawValue());
+        self::addLong($meta, 'count', $entry->count());
+        self::addPointer($meta, 'members', $members->getRawValue());
 
-        $this->addPointer($this->root, $name, $meta->getRawValue());
+        // add() is an upsert: a previous record under this name is simply replaced, which
+        // is why PersistentStore hydrates it BEFORE calling store()
+        self::addPointer($this->entries, $name, $meta->getRawValue());
     }
 
-    public function find(string $name): ?PersistedEntry
+    /**
+     * Removes an entry from the registry and reclaims its own bookkeeping
+     *
+     * Member objects are untouched here - see PersistentStore::releaseEntry() for the
+     * share accounting that decides which of them may actually be freed.
+     */
+    public function removeEntry(string $name, PersistedEntry $entry): void
     {
-        $metaValue = $this->root->find($name);
-        if ($metaValue === null) {
-            return null;
-        }
+        $this->entries->delete($name);
 
-        return $this->hydrate($metaValue);
+        Reclaimer::reclaimEntry($entry);
+    }
+
+    /**
+     * Reclaims the bookkeeping of an entry that has already been REPLACED under its name
+     *
+     * store() is an upsert: after it, the name points at the new record and the previous
+     * one is unreachable but still allocated. Deleting the name would remove the new
+     * record, so the superseded generation is only reclaimed, never unlinked.
+     */
+    public function discardEntry(PersistedEntry $entry): void
+    {
+        Reclaimer::reclaimEntry($entry);
+    }
+
+    /**
+     * Drops an object from the global object table and reclaims everything it owns
+     *
+     * Only legal once the object's share count has reached zero.
+     */
+    public function removeObject(PersistedObject $object): void
+    {
+        $this->objects->deleteIndex($object->address);
+
+        Reclaimer::reclaimObject($object);
+    }
+
+    /**
+     * Adds $delta to an object's share count and returns the new value
+     */
+    public function adjustShares(int $address, int $delta): int
+    {
+        $object = $this->findObject($address);
+        if ($object === null) {
+            throw new \RuntimeException(sprintf(
+                'Persistent object at address 0x%x is not registered; the registry is inconsistent',
+                $address,
+            ));
+        }
+        $shares = $object->shares + $delta;
+        \assert($object->metaTable !== null);
+
+        self::addLong(PersistentHashTable::fromCData($object->metaTable), 'shares', $shares);
+
+        return $shares;
+    }
+
+    public function findEntry(string $name): ?PersistedEntry
+    {
+        $metaValue = $this->entries->find($name);
+
+        return $metaValue === null ? null : $this->hydrateEntry($metaValue);
     }
 
     /**
      * @return iterable<string, PersistedEntry>
      */
-    public function all(): iterable
+    public function allEntries(): iterable
     {
-        foreach ($this->root->getIterator() as $name => $metaValue) {
-            yield (string) $name => $this->hydrate($metaValue);
+        foreach ($this->entries->getIterator() as $name => $metaValue) {
+            yield (string) $name => $this->hydrateEntry($metaValue);
+        }
+    }
+
+    /**
+     * Returns the persisted metadata of one object clone, by its address
+     */
+    public function findObject(int $address): ?PersistedObject
+    {
+        $metaValue = $this->objects->findIndex($address);
+
+        return $metaValue === null ? null : self::hydrateObject($address, $metaValue);
+    }
+
+    /**
+     * Walks every persisted object exactly once, regardless of how many entries share it
+     *
+     * @return iterable<int, PersistedObject>
+     */
+    public function allObjects(): iterable
+    {
+        // The object table is integer-keyed, and the engine yields no key for such buckets;
+        // the address is recovered from the clone pointer, which is where it came from
+        foreach ($this->objects->getIterator() as $metaValue) {
+            $object = self::hydrateObject(0, $metaValue);
+            $object->address = Core::addressOf($object->object);
+
+            yield $object->address => $object;
         }
     }
 
     public function has(string $name): bool
     {
-        return $this->root->find($name) !== null;
+        return $this->entries->find($name) !== null;
     }
 
     /**
-     * Returns the names of all persisted objects
+     * Returns the names of all persisted graphs
      *
      * @return list<string>
      */
     public function names(): array
     {
         $names = [];
-        foreach ($this->root->getIterator() as $name => $metaValue) {
+        foreach ($this->entries->getIterator() as $name => $metaValue) {
             $names[] = (string) $name;
         }
 
         return $names;
     }
 
-    private function hydrate(ReflectionValue $metaValue): PersistedEntry
+    /**
+     * Number of object clones currently held by the registry (shared ones counted once)
+     *
+     * Reclamation bookkeeping in one number: it grows with every newly persisted object
+     * and falls back when drop() releases the last entry referencing one.
+     */
+    public function objectCount(): int
+    {
+        return $this->objects->getRawValue()->nNumOfElements;
+    }
+
+    /**
+     * Writes one object record into the global object table (share count starts at zero)
+     */
+    private function addObject(PersistedObject $object): void
+    {
+        $arrays = PersistentHashTable::create();
+        foreach ($object->arrays as $index => $array) {
+            self::addPointer($arrays, $index, $array);
+        }
+
+        $meta = PersistentHashTable::create();
+        self::addPointer($meta, 'object', $object->object);
+        self::addPointer($meta, 'snapshot', $object->snapshot);
+        self::addInternedString($meta, 'class', $object->className);
+        self::addInternedString($meta, 'signature', $object->signature);
+        self::addLong($meta, 'shares', 0);
+        self::addPointer($meta, 'arrays', $arrays->getRawValue());
+
+        $object->shares      = 0;
+        $object->metaTable   = $meta->getRawValue();
+        $object->arraysTable = $arrays->getRawValue();
+
+        self::addPointer($this->objects, $object->address, $meta->getRawValue());
+    }
+
+    private function hydrateEntry(ReflectionValue $metaValue): PersistedEntry
     {
         $meta = PersistentHashTable::fromCData(Core::cast('HashTable *', $metaValue->getRawPointer()));
         $meta->find('count')->getNativeValue($count);
 
-        $objectTable    = $this->graphTable($meta, 'objects');
-        $snapshotTable  = $this->graphTable($meta, 'snapshots');
-        $classTable     = $this->graphTable($meta, 'classes');
-        $signatureTable = $this->graphTable($meta, 'signatures');
+        $membersTable = self::tableAt($meta, 'members');
 
-        $objects    = [];
-        $snapshots  = [];
-        $classNames = [];
-        $signatures = [];
+        $members = [];
         for ($index = 0; $index < $count; $index++) {
-            $classTable->findIndex($index)->getNativeValue($className);
-            $signatureTable->findIndex($index)->getNativeValue($signature);
-
-            $objects[]    = Core::cast('zend_object *', $objectTable->findIndex($index)->getRawPointer());
-            $snapshots[]  = Core::cast('char *', $snapshotTable->findIndex($index)->getRawPointer());
-            $classNames[] = $className;
-            $signatures[] = $signature;
+            $membersTable->findIndex($index)->getNativeValue($address);
+            $members[] = $address;
         }
 
-        return new PersistedEntry($objects, $snapshots, $classNames, $signatures);
+        return new PersistedEntry($members, [], $meta->getRawValue(), $membersTable->getRawValue());
+    }
+
+    private static function hydrateObject(int $address, ReflectionValue $metaValue): PersistedObject
+    {
+        $meta = PersistentHashTable::fromCData(Core::cast('HashTable *', $metaValue->getRawPointer()));
+        $meta->find('class')->getNativeValue($className);
+        $meta->find('signature')->getNativeValue($signature);
+        $meta->find('shares')->getNativeValue($shares);
+
+        $arraysTable = self::tableAt($meta, 'arrays');
+
+        $arrays = [];
+        foreach ($arraysTable->getIterator() as $arrayValue) {
+            $arrays[] = Core::cast('HashTable *', $arrayValue->getRawPointer());
+        }
+
+        return new PersistedObject(
+            $address,
+            Core::cast('zend_object *', $meta->find('object')->getRawPointer()),
+            Core::cast('char *', $meta->find('snapshot')->getRawPointer()),
+            $className,
+            $signature,
+            $arrays,
+            $shares,
+            $meta->getRawValue(),
+            $arraysTable->getRawValue(),
+        );
     }
 
     /**
-     * Recovers one of the index-keyed per-graph tables of an entry
+     * Recovers a nested persistent table stored as an IS_PTR value under $key
      */
-    private function graphTable(PersistentHashTable $meta, string $key): PersistentHashTable
+    private static function tableAt(PersistentHashTable $table, string $key): PersistentHashTable
     {
-        return PersistentHashTable::fromCData(Core::cast('HashTable *', $meta->find($key)->getRawPointer()));
+        $value = $table->find($key);
+        if ($value === null) {
+            throw new \RuntimeException("Persistent registry is missing the '{$key}' table");
+        }
+
+        return PersistentHashTable::fromCData(Core::cast('HashTable *', $value->getRawPointer()));
     }
 
     /**
@@ -182,16 +353,16 @@ final class Registry
      * (an 8-byte pointer CData cannot be cast to a 16-byte zval), direct union-member
      * assignment can. The engine copies the temporary container into its bucket.
      */
-    private function addPointer(PersistentHashTable $table, string|int $key, CData $pointer): void
+    private static function addPointer(PersistentHashTable $table, string|int $key, CData $pointer): void
     {
         $container                = Core::new('zval');
         $container->value->ptr    = Core::cast('void *', $pointer);
         $container->u1->type_info = ReflectionValue::IS_PTR;
 
-        $this->addValue($table, $key, $container);
+        self::addValue($table, $key, $container);
     }
 
-    private function addInternedString(PersistentHashTable $table, string|int $key, string $string): void
+    private static function addInternedString(PersistentHashTable $table, string|int $key, string $string): void
     {
         $interned = StringEntry::persistentInterned($string);
 
@@ -200,22 +371,22 @@ final class Registry
         // Bare IS_STRING: interned payloads are stored without refcounting
         $container->u1->type_info = ReflectionValue::IS_STRING;
 
-        $this->addValue($table, $key, $container);
+        self::addValue($table, $key, $container);
     }
 
-    private function addLong(PersistentHashTable $table, string|int $key, int $number): void
+    private static function addLong(PersistentHashTable $table, string|int $key, int $number): void
     {
         $container                = Core::new('zval');
         $container->value->lval   = $number;
         $container->u1->type_info = ReflectionValue::IS_LONG;
 
-        $this->addValue($table, $key, $container);
+        self::addValue($table, $key, $container);
     }
 
     /**
      * Stores a hand-built zval container under a string or integer key
      */
-    private function addValue(PersistentHashTable $table, string|int $key, CData $container): void
+    private static function addValue(PersistentHashTable $table, string|int $key, CData $container): void
     {
         $value = ReflectionValue::fromValueEntry(Core::addr($container));
 

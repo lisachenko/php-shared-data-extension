@@ -24,9 +24,9 @@ use ZEngine\EngineExtension\ModuleLifecycleInterface;
  * The module globals hold two machine words that survive the request boundary in the
  * worker process:
  *   [0] pointer to the persistent registry HashTable (0 until first boot)
- *   [1] layout version of the registry format (Registry::LAYOUT_VERSION), written when
- *       the registry is created and verified on every later boot - a worker holding a
- *       registry from an older build is rejected instead of misread
+ *   [1] layout version of the registry format (Registry::LAYOUT_VERSION, currently 3),
+ *       written when the registry is created and verified on every later boot - a worker
+ *       holding a registry from an older build is rejected instead of misread
  *
  * This is the same cross-request anchor mechanism as the counter demo in demo.php,
  * reduced to a single pointer slot: everything else persistent hangs off the registry.
@@ -88,16 +88,20 @@ final class ObjectPersistenceModule extends AbstractModule implements ModuleInfo
      */
     public function getDisplayInfo(): array
     {
-        $names = [];
-        $globals = $this->getGlobals();
+        $names       = [];
+        $objectCount = 0;
+        $globals     = $this->getGlobals();
         if ($globals !== null && $globals[0] !== 0) {
-            $names = Registry::fromAddress($globals[0])->names();
+            $registry    = Registry::fromAddress($globals[0]);
+            $names       = $registry->names();
+            $objectCount = $registry->objectCount();
         }
 
         return [
             'Persistent objects support' => 'enabled',
-            'Persisted objects'          => count($names),
-            'Persisted object names'     => $names === [] ? '(none)' : implode(', ', $names),
+            'Persisted entries'          => count($names),
+            'Persisted object clones'    => $objectCount,
+            'Persisted entry names'      => $names === [] ? '(none)' : implode(', ', $names),
         ];
     }
 
