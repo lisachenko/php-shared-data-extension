@@ -130,5 +130,5 @@ php -d ffi.enable=1 demo.php           # original shared C data demo
 ## Requirements
 
 - PHP ~8.4 (NTS) with `ext-ffi`
-- `lisachenko/z-engine` (the branch this feature was developed against; a
-  tagged release will follow)
+- `lisachenko/z-engine` `dev-master` (or the `8.4` release line once tagged —
+  z-engine versions follow the PHP version they target)
