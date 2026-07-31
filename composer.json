@@ -2,14 +2,8 @@
     "name": "lisachenko/php-shared-data-extension",
     "description": "Shared data extension for PHP: persistent memory and request-surviving objects",
     "type": "library",
-    "repositories": [
-        {
-            "type": "vcs",
-            "url": "https://github.com/lisachenko/z-engine"
-        }
-    ],
     "require": {
-        "lisachenko/z-engine": "dev-claude/shared-objects-dag-memory-nq462w",
+        "lisachenko/z-engine": "dev-master || ^8.4",
         "php": "~8.4.0",
         "ext-ffi": "*"
     },
