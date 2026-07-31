@@ -103,6 +103,21 @@ final class Registry
         return $this->root->find($name) !== null;
     }
 
+    /**
+     * Returns the names of all persisted objects
+     *
+     * @return list<string>
+     */
+    public function names(): array
+    {
+        $names = [];
+        foreach ($this->root->getIterator() as $name => $metaValue) {
+            $names[] = (string) $name;
+        }
+
+        return $names;
+    }
+
     private function hydrate(ReflectionValue $metaValue): PersistedEntry
     {
         $meta = PersistentHashTable::fromCData(Core::cast('HashTable *', $metaValue->getRawPointer()));

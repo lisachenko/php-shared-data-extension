@@ -95,6 +95,13 @@ anything whose identity or lifetime cannot outlive a request:
   request, and an opcache restart invalidates permanently-interned string
   pointers shared with persisted state — restart workers together with opcache.
 
+### Introspection
+
+The module surfaces its state in `phpinfo()` / `php -i` (persisted object count and
+names in the `shared_objects` section) and declares an engine-enforced dependency on
+`ext-ffi`. At request end a module-level `requestShutdown()` callback acts as a
+belt-and-braces detach on top of the store's own shutdown function.
+
 ## API
 
 ```php

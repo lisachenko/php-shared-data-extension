@@ -206,6 +206,42 @@ class PersistentStoreTest extends TestCase
         $this->store->persist($this->name, $config);
     }
 
+    public function testModuleExposesStateInPhpinfoSection(): void
+    {
+        $this->store->persist($this->name, $this->makeConfig());
+
+        ob_start();
+        phpinfo(INFO_MODULES);
+        $info = (string) ob_get_clean();
+
+        $section = strstr((string) strstr($info, 'shared_objects'), "\n\n", true);
+        $this->assertIsString($section);
+        $this->assertStringContainsString('Persistent objects support => enabled', $section);
+        $this->assertStringContainsString($this->name, $section);
+    }
+
+    public function testModuleDeclaresFfiDependency(): void
+    {
+        // Boot guarantees registration; deps are read back through native reflection
+        $this->assertSame(['FFI' => 'Required'], (new \ReflectionExtension('shared_objects'))->getDependencies());
+    }
+
+    public function testDetachActiveStoresIsIdempotentBeltAndBraces(): void
+    {
+        $config = $this->store->persist($this->name, $this->makeConfig());
+        $config->bootCount = 777;
+        unset($config);
+
+        // The module-level request-end path detaches the store; a second detach (the
+        // store's own shutdown function) must be a harmless no-op
+        PersistentStore::detachActiveStores();
+        PersistentStore::detachActiveStores();
+        $this->store->detach();
+
+        $restored = $this->store->attach()[$this->name];
+        $this->assertSame(1, $restored->bootCount);
+    }
+
     public function testDestructorNeverRunsForPersistedObjects(): void
     {
         $candidate = new class {

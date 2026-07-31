@@ -40,6 +40,14 @@ use ZEngine\Type\PersistentObjectFactory;
  */
 final class PersistentStore
 {
+    /**
+     * Stores booted during this request, keyed by module name (request-scoped: PHP
+     * statics reset per request, exactly like the shutdown functions the stores arm)
+     *
+     * @var array<string, self>
+     */
+    private static array $activeStores = [];
+
     private Registry $registry;
 
     private Persister $persister;
@@ -83,7 +91,24 @@ final class PersistentStore
             $registry = Registry::fromAddress($globals[0]);
         }
 
-        return new self($registry);
+        $store = new self($registry);
+
+        self::$activeStores[$moduleName] = $store;
+
+        return $store;
+    }
+
+    /**
+     * Detaches every store booted during this request (idempotent per store)
+     *
+     * Invoked by ObjectPersistenceModule::requestShutdown() as the belt-and-braces
+     * request-end path; stores normally detach through their own shutdown function.
+     */
+    public static function detachActiveStores(): void
+    {
+        foreach (self::$activeStores as $store) {
+            $store->detach();
+        }
     }
 
     /**
