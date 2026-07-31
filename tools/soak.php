@@ -45,7 +45,7 @@ $config            = new SoakConfig();
 $config->env       = 'production';
 $config->bootCount = 1;
 $config->settings  = ['db' => ['host' => 'localhost', 'port' => 5432], 'features' => ['a', 'b', 'c']];
-$store->persist('config', $config);
+$store->persist(SoakConfig::class, $config);
 unset($config);
 
 $baseline = null;
@@ -54,7 +54,7 @@ for ($iteration = 1; $iteration <= $totalIterations; $iteration++) {
     $store->detach();
 
     $objects = $store->attach();
-    $current = $objects['config'];
+    $current = $objects[SoakConfig::class];
 
     if ($current->env !== 'production' || $current->bootCount !== 1) {
         fwrite(STDERR, "Frozen state corrupted at iteration {$iteration}\n");

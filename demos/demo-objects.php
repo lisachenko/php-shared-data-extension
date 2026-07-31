@@ -29,7 +29,7 @@ class AppConfig
 
 $store = PersistentStore::boot();
 
-if (!$store->has('config')) {
+if (!$store->has(AppConfig::class)) {
     // Expensive one-time initialization: runs ONCE per worker process
     $config            = new AppConfig();
     $config->env       = 'production';
@@ -40,11 +40,11 @@ if (!$store->has('config')) {
     ];
 
     // The returned instance is the canonical persistent one - keep using it
-    $config = $store->persist('config', $config);
+    $config = $store->persist(AppConfig::class, $config);
     echo "Initialized config for this worker\n";
 } else {
     // Later requests in the same worker recover the object instantly
-    $config = $store->get('config');
+    $config = $store->get(AppConfig::class);
     echo "Recovered config persisted earlier in this worker\n";
 }
 

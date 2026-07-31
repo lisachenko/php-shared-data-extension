@@ -22,14 +22,18 @@ Core::init(); // or Core::preload() from opcache.preload
 
 $store = PersistentStore::boot();
 
-if (!$store->has('config')) {
+if (!$store->has(AppConfig::class)) {
     // Expensive one-time initialization: runs ONCE per worker process
-    $config = $store->persist('config', buildExpensiveConfig());
+    $config = $store->persist(AppConfig::class, buildExpensiveConfig());
 } else {
     // Every later request in this worker: instant recovery, no re-initialization
-    $config = $store->get('config');
+    $config = $store->get(AppConfig::class);
 }
 ```
+
+Storage is keyed by `ClassName::class` (a class or interface of the instance), so
+static analysis and IDE autocompletion know the type: `get(AppConfig::class)` is
+inferred as `AppConfig` through PHPStan generic templates.
 
 Use cases: framework kernel, a booted DI container, configuration/route/metadata
 objects — anything expensive to build and read-mostly afterwards.
@@ -105,12 +109,12 @@ belt-and-braces detach on top of the store's own shutdown function.
 ## API
 
 ```php
-$store = PersistentStore::boot();      // register/reattach the persistent module
-$store->persist(string $name, object $o): object;  // convert + return canonical instance
-$store->attach(): array;               // name => instance for this request (idempotent)
-$store->get(string $name): ?object;    // canonical instance or null
-$store->has(string $name): bool;
-$store->detach(): void;                // runs automatically at request shutdown
+$store = PersistentStore::boot();          // register/reattach the persistent module
+$store->persist(User::class, $o): User;    // convert + return canonical instance (T of class-string<T>)
+$store->attach(): array;                   // class-string => instance for this request (idempotent)
+$store->get(User::class): ?User;           // canonical instance or null
+$store->has(User::class): bool;
+$store->detach(): void;                    // runs automatically at request shutdown
 ```
 
 ## Testing

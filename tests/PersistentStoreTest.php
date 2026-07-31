@@ -18,20 +18,16 @@ use PHPUnit\Framework\TestCase;
 
 /**
  * The persistent module and registry survive for the whole test process (that is the
- * feature), so every test uses unique object names and detaches what it attached.
+ * feature): persist() is an upsert per class-string key, so every test re-persists its
+ * own fresh state and detaches what it attached.
  */
 class PersistentStoreTest extends TestCase
 {
-    private static int $sequence = 0;
-
     private PersistentStore $store;
-
-    private string $name;
 
     protected function setUp(): void
     {
         $this->store = PersistentStore::boot();
-        $this->name  = 'object-' . self::$sequence++;
     }
 
     protected function tearDown(): void
@@ -56,7 +52,7 @@ class PersistentStoreTest extends TestCase
 
     public function testPersistReturnsCanonicalWorkingInstance(): void
     {
-        $persisted = $this->store->persist($this->name, $this->makeConfig());
+        $persisted = $this->store->persist(AppConfig::class, $this->makeConfig());
 
         $this->assertInstanceOf(AppConfig::class, $persisted);
         $this->assertSame('production', $persisted->env);
@@ -68,19 +64,19 @@ class PersistentStoreTest extends TestCase
         $this->assertSame(['a' => 1], $persisted->revealInternal());
 
         // Identity is stable within the request
-        $this->assertSame($persisted, $this->store->get($this->name));
-        $this->assertTrue($this->store->has($this->name));
+        $this->assertSame($persisted, $this->store->get(AppConfig::class));
+        $this->assertTrue($this->store->has(AppConfig::class));
     }
 
     public function testStateSurvivesDetachAttachCycles(): void
     {
-        $this->store->persist($this->name, $this->makeConfig());
+        $this->store->persist(AppConfig::class, $this->makeConfig());
 
         for ($cycle = 0; $cycle < 25; $cycle++) {
             $this->store->detach();
 
             $objects = $this->store->attach();
-            $config  = $objects[$this->name];
+            $config  = $objects[AppConfig::class];
             $this->assertSame('production', $config->env);
             $this->assertSame(1, $config->bootCount);
             $this->assertSame(['alpha', 'beta'], $config->settings['features']);
@@ -95,7 +91,7 @@ class PersistentStoreTest extends TestCase
 
     public function testMutationsRollBackToFrozenSnapshot(): void
     {
-        $config = $this->store->persist($this->name, $this->makeConfig());
+        $config = $this->store->persist(AppConfig::class, $this->makeConfig());
 
         $config->env       = 'mutated-' . str_repeat('x', 64);
         $config->bootCount = 999;
@@ -107,7 +103,7 @@ class PersistentStoreTest extends TestCase
         unset($config, $vars);
 
         $this->store->detach();
-        $restored = $this->store->attach()[$this->name];
+        $restored = $this->store->attach()[AppConfig::class];
 
         $this->assertSame('production', $restored->env);
         $this->assertSame(1, $restored->bootCount);
@@ -116,15 +112,15 @@ class PersistentStoreTest extends TestCase
 
     public function testSecondStoreRecoversRegistryFromModuleGlobals(): void
     {
-        $this->store->persist($this->name, $this->makeConfig());
+        $this->store->persist(AppConfig::class, $this->makeConfig());
         $this->store->detach();
 
         // A fresh store instance only shares the persistent module globals - this is
         // the same recovery path a new request takes in a worker
         $secondStore = PersistentStore::boot();
         try {
-            $this->assertTrue($secondStore->has($this->name));
-            $recovered = $secondStore->get($this->name);
+            $this->assertTrue($secondStore->has(AppConfig::class));
+            $recovered = $secondStore->get(AppConfig::class);
             $this->assertInstanceOf(AppConfig::class, $recovered);
             $this->assertSame('production', $recovered->env);
             $this->assertSame(1, $recovered->bootCount);
@@ -136,7 +132,7 @@ class PersistentStoreTest extends TestCase
 
     public function testArraysAreCopiedOnWriteNotShared(): void
     {
-        $config = $this->store->persist($this->name, $this->makeConfig());
+        $config = $this->store->persist(AppConfig::class, $this->makeConfig());
 
         $copy = $config->settings;
         $copy['db']['host'] = 'far-away';
@@ -154,7 +150,7 @@ class PersistentStoreTest extends TestCase
 
         $this->expectException(NotPersistableException::class);
         $this->expectExceptionMessageMatches('/\$root::\$handle.*resources/');
-        $this->store->persist($this->name, $candidate);
+        $this->store->persist($candidate::class, $candidate);
     }
 
     public function testNestedObjectIsRejected(): void
@@ -166,7 +162,7 @@ class PersistentStoreTest extends TestCase
 
         $this->expectException(NotPersistableException::class);
         $this->expectExceptionMessageMatches('/\$root::\$inner.*nested objects/');
-        $this->store->persist($this->name, $candidate);
+        $this->store->persist($candidate::class, $candidate);
     }
 
     public function testClosurePropertyIsRejected(): void
@@ -177,14 +173,21 @@ class PersistentStoreTest extends TestCase
         $candidate->callback = static fn (): int => 42;
 
         $this->expectException(NotPersistableException::class);
-        $this->store->persist($this->name, $candidate);
+        $this->store->persist($candidate::class, $candidate);
     }
 
     public function testInternalClassIsRejected(): void
     {
         $this->expectException(NotPersistableException::class);
         $this->expectExceptionMessageMatches('/internal classes/');
-        $this->store->persist($this->name, new \ArrayObject([1, 2, 3]));
+        $this->store->persist(\ArrayObject::class, new \ArrayObject([1, 2, 3]));
+    }
+
+    public function testKeyMustNameAClassOfTheInstance(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/must name a class or interface/');
+        $this->store->persist(\DateTimeInterface::class, $this->makeConfig());
     }
 
     public function testDynamicPropertyIsRejected(): void
@@ -193,7 +196,7 @@ class PersistentStoreTest extends TestCase
         $candidate->foo = 'bar';
 
         $this->expectException(NotPersistableException::class);
-        $this->store->persist($this->name, $candidate);
+        $this->store->persist($candidate::class, $candidate);
     }
 
     public function testNestedArrayObjectValueIsRejectedWithPath(): void
@@ -203,12 +206,12 @@ class PersistentStoreTest extends TestCase
 
         $this->expectException(NotPersistableException::class);
         $this->expectExceptionMessageMatches('/\$root::\$settings\[services\]\[logger\]/');
-        $this->store->persist($this->name, $config);
+        $this->store->persist(AppConfig::class, $config);
     }
 
     public function testModuleExposesStateInPhpinfoSection(): void
     {
-        $this->store->persist($this->name, $this->makeConfig());
+        $this->store->persist(AppConfig::class, $this->makeConfig());
 
         ob_start();
         phpinfo(INFO_MODULES);
@@ -217,7 +220,7 @@ class PersistentStoreTest extends TestCase
         $section = strstr((string) strstr($info, 'shared_objects'), "\n\n", true);
         $this->assertIsString($section);
         $this->assertStringContainsString('Persistent objects support => enabled', $section);
-        $this->assertStringContainsString($this->name, $section);
+        $this->assertStringContainsString(AppConfig::class, $section);
     }
 
     public function testModuleDeclaresFfiDependency(): void
@@ -228,7 +231,7 @@ class PersistentStoreTest extends TestCase
 
     public function testDetachActiveStoresIsIdempotentBeltAndBraces(): void
     {
-        $config = $this->store->persist($this->name, $this->makeConfig());
+        $config = $this->store->persist(AppConfig::class, $this->makeConfig());
         $config->bootCount = 777;
         unset($config);
 
@@ -238,7 +241,7 @@ class PersistentStoreTest extends TestCase
         PersistentStore::detachActiveStores();
         $this->store->detach();
 
-        $restored = $this->store->attach()[$this->name];
+        $restored = $this->store->attach()[AppConfig::class];
         $this->assertSame(1, $restored->bootCount);
     }
 
@@ -255,7 +258,7 @@ class PersistentStoreTest extends TestCase
             }
         };
 
-        $persisted = $this->store->persist($this->name, $candidate);
+        $persisted = $this->store->persist($candidate::class, $candidate);
         unset($persisted);
         $this->store->detach();
         gc_collect_cycles();

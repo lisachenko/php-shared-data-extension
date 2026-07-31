@@ -52,10 +52,10 @@ final class PersistentStore
 
     private Persister $persister;
 
-    /** @var array<string, object> Materialized canonical instances for this request */
+    /** @var array<class-string, object> Materialized canonical instances for this request */
     private array $instances = [];
 
-    /** @var array<string, int> Object-store handles held during this request */
+    /** @var array<class-string, int> Object-store handles held during this request */
     private array $handles = [];
 
     private bool $attached = false;
@@ -114,31 +114,48 @@ final class PersistentStore
     /**
      * Moves an object's state into persistent memory and returns the canonical instance
      *
-     * The instance is immediately live for the current request; on later requests it is
-     * re-materialized by attach() under the same name.
+     * Storage is keyed by class (or interface) name, so static analyzers infer the
+     * instance type from the key: `$store->get(AppConfig::class)` is an AppConfig. The
+     * instance is immediately live for the current request; on later requests it is
+     * re-materialized by attach() under the same key.
+     *
+     * @template T of object
+     *
+     * @param class-string<T> $className Storage key; the object must be an instance of it
+     * @param T               $object
+     *
+     * @return T The canonical persistent instance
      */
-    public function persist(string $name, object $object): object
+    public function persist(string $className, object $object): object
     {
+        if (!$object instanceof $className) {
+            throw new \InvalidArgumentException(sprintf(
+                'Storage key %s must name a class or interface of the persisted instance %s',
+                $className,
+                get_class($object),
+            ));
+        }
         $this->attach();
 
         $entry = $this->persister->persistObject($object);
-        $this->registry->store($name, $entry);
+        $this->registry->store($className, $entry);
 
-        return $this->materialize($name, $entry);
+        /** @var T */
+        return $this->materialize($className, $entry);
     }
 
     /**
      * Re-registers every persisted object for the current request
      *
-     * @return array<string, object> name => canonical instance
+     * @return array<class-string, object> class-string key => canonical instance
      */
     public function attach(): array
     {
         if (!$this->attached) {
             $this->attached = true;
-            foreach ($this->registry->all() as $name => $entry) {
+            foreach ($this->registry->all() as $className => $entry) {
                 $this->rebindClassEntry($entry);
-                $this->materialize($name, $entry);
+                $this->materialize($className, $entry);
             }
             $this->armShutdown();
         }
@@ -146,16 +163,29 @@ final class PersistentStore
         return $this->instances;
     }
 
-    public function get(string $name): ?object
+    /**
+     * @template T of object
+     *
+     * @param class-string<T> $className
+     *
+     * @return T|null
+     */
+    public function get(string $className): ?object
     {
         $this->attach();
 
-        return $this->instances[$name] ?? null;
+        $instance = $this->instances[$className] ?? null;
+        \assert($instance === null || $instance instanceof $className);
+
+        return $instance;
     }
 
-    public function has(string $name): bool
+    /**
+     * @param class-string $className
+     */
+    public function has(string $className): bool
     {
-        return $this->registry->has($name);
+        return $this->registry->has($className);
     }
 
     /**
