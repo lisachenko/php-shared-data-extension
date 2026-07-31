@@ -24,7 +24,9 @@ use ZEngine\EngineExtension\ModuleLifecycleInterface;
  * The module globals hold two machine words that survive the request boundary in the
  * worker process:
  *   [0] pointer to the persistent registry HashTable (0 until first boot)
- *   [1] reserved for a layout/version tag of the registry format
+ *   [1] layout version of the registry format (Registry::LAYOUT_VERSION), written when
+ *       the registry is created and verified on every later boot - a worker holding a
+ *       registry from an older build is rejected instead of misread
  *
  * This is the same cross-request anchor mechanism as the counter demo in demo.php,
  * reduced to a single pointer slot: everything else persistent hangs off the registry.
@@ -62,7 +64,7 @@ final class ObjectPersistenceModule extends AbstractModule implements ModuleInfo
     }
 
     /**
-     * Two persistent machine words: registry pointer + reserved version tag
+     * Two persistent machine words: registry pointer + registry layout version tag
      */
     public static function globalType(): ?string
     {

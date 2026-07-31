@@ -16,6 +16,12 @@ declare(strict_types=1);
  * thousands of requests and asserts request memory stays flat after warm-up.
  * Exits non-zero on growth, so it can act as a CI gate.
  *
+ * The soaked payload is a real object graph: a config with two nested services, ONE
+ * logger shared by both (diamond) and a back-reference from each service to the config
+ * (cycle). Every iteration reads through the nesting, mutates nested properties and
+ * replaces whole nested-object slots, so the per-object snapshot rollback and the
+ * request-object releases it performs are exercised on every cycle.
+ *
  * Usage: php -d ffi.enable=1 tools/soak.php [iterations]
  */
 
@@ -26,6 +32,22 @@ require __DIR__ . '/../vendor/autoload.php';
 
 Core::init();
 
+class SoakLogger
+{
+    public string $channel = '';
+
+    public array $levels = [];
+}
+
+class SoakService
+{
+    public string $dsn = '';
+
+    public ?SoakLogger $logger = null;
+
+    public ?SoakConfig $owner = null;
+}
+
 class SoakConfig
 {
     public string $env = 'dev';
@@ -33,6 +55,10 @@ class SoakConfig
     public int $bootCount = 0;
 
     public array $settings = [];
+
+    public ?SoakService $primary = null;
+
+    public ?SoakService $replica = null;
 }
 
 $totalIterations  = (int) ($argv[1] ?? 5_000);
@@ -41,12 +67,25 @@ $allowedGrowth    = 64 * 1024; // bytes after warm-up
 
 $store = PersistentStore::boot();
 
+$logger          = new SoakLogger();
+$logger->channel = 'app';
+$logger->levels  = ['debug', 'info', 'error'];
+
 $config            = new SoakConfig();
 $config->env       = 'production';
 $config->bootCount = 1;
 $config->settings  = ['db' => ['host' => 'localhost', 'port' => 5432], 'features' => ['a', 'b', 'c']];
+
+foreach (['primary', 'replica'] as $role) {
+    $service         = new SoakService();
+    $service->dsn    = "pgsql:host=localhost;role={$role}";
+    $service->logger = $logger;  // diamond: one logger, two owners
+    $service->owner  = $config;  // cycle: back to the graph root
+    $config->{$role} = $service;
+}
+
 $store->persist(SoakConfig::class, $config);
-unset($config);
+unset($config, $logger, $service);
 
 $baseline = null;
 
@@ -64,12 +103,29 @@ for ($iteration = 1; $iteration <= $totalIterations; $iteration++) {
         fwrite(STDERR, "Persistent array corrupted at iteration {$iteration}\n");
         exit(1);
     }
+    if ($current->primary->dsn !== 'pgsql:host=localhost;role=primary'
+        || $current->primary->logger->levels[2] !== 'error') {
+        fwrite(STDERR, "Nested object state corrupted at iteration {$iteration}\n");
+        exit(1);
+    }
+    if ($current->primary->logger !== $current->replica->logger) {
+        fwrite(STDERR, "Shared (diamond) object identity lost at iteration {$iteration}\n");
+        exit(1);
+    }
+    if ($current->primary->owner !== $current || $current->replica->owner !== $current) {
+        fwrite(STDERR, "Graph cycle broken at iteration {$iteration}\n");
+        exit(1);
+    }
 
     // Mutate everything, including engine paths that build the properties cache
-    $current->env       = "mutated-{$iteration}";
-    $current->bootCount = $iteration;
-    $current->settings  = ['replaced' => $iteration];
-    $probe              = get_object_vars($current);
+    $current->env                    = "mutated-{$iteration}";
+    $current->bootCount              = $iteration;
+    $current->settings               = ['replaced' => $iteration];
+    $current->primary->dsn           = "mutated-{$iteration}";
+    $current->primary->logger->levels = ['replaced'];
+    $current->replica->logger        = new SoakLogger();  // whole nested-object slot
+    $current->primary                = new SoakService(); // and a nested slot on the root
+    $probe                           = get_object_vars($current);
     unset($current, $objects, $probe);
 
     if ($iteration === $warmupIterations) {

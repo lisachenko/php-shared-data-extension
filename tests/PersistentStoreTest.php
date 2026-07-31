@@ -153,15 +153,17 @@ class PersistentStoreTest extends TestCase
         $this->store->persist($candidate::class, $candidate);
     }
 
-    public function testNestedObjectIsRejected(): void
+    public function testNestedInternalObjectIsRejectedWithPath(): void
     {
+        // Nested objects are supported since v2 - but stdClass is an internal class, so
+        // this one is still rejected, now for the honest reason and with the same path
         $candidate        = new class {
             public mixed $inner = null;
         };
         $candidate->inner = new \stdClass();
 
         $this->expectException(NotPersistableException::class);
-        $this->expectExceptionMessageMatches('/\$root::\$inner.*nested objects/');
+        $this->expectExceptionMessageMatches('/\$root::\$inner.*internal classes/');
         $this->store->persist($candidate::class, $candidate);
     }
 

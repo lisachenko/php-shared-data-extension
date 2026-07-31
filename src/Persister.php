@@ -21,95 +21,79 @@ use ZEngine\Type\PersistentObjectFactory;
 use ZEngine\Type\StringEntry;
 
 /**
- * Deep converter: moves an object's state into persistent (malloc) memory
+ * Deep converter: moves an object graph's state into persistent (malloc) memory
  *
- * Conversion model (v1, flat objects):
- *  - the object itself becomes a refcount-pinned persistent clone
- *    (PersistentObjectFactory::persistentClone); the source object stays a completely
- *    ordinary request object - the CLONE is the canonical persistent instance;
+ * Conversion model (v2, object graphs):
+ *  - every object of the graph becomes a refcount-pinned persistent clone
+ *    (PersistentObjectFactory::persistentClone); the source objects stay completely
+ *    ordinary request objects - the CLONES are the canonical persistent instances;
+ *  - the walk is keyed by the SOURCE zend_object address, so an object reached twice
+ *    is converted once: diamonds keep their shared identity and cycles terminate.
+ *    Every clone is registered in that map BEFORE its own slots are converted, which
+ *    is what makes a self-reference resolve to the clone instead of recursing forever;
+ *  - nested-object slots keep their refcounted IS_OBJECT_EX type_info and are simply
+ *    retargeted at the child clone: the byte-copied slot never owned a reference to the
+ *    source object, and the clone's refcount pin absorbs request-time addref/delref;
  *  - scalar property slots (null/bool/int/float) are plain byte copies;
  *  - strings become persistent interned strings stored in NON-refcounted zval slots -
  *    engine copies share the pointer and copy-on-write on mutation. Strings already
  *    flagged IS_STR_PERMANENT (startup interned / opcache SHM) are kept by pointer;
  *  - arrays are rebuilt element-by-element as sealed (immutable) PersistentHashTables,
- *    recursively applying the same rules; array keys are interned persistently;
- *  - everything else is rejected with the property path in the message: nested objects
- *    (v1 limitation), closures, resources, references, internal classes, enums,
- *    objects with dynamic properties, lazy objects, and objects whose handlers are not
- *    the engine's std_object_handlers.
+ *    recursively applying the same rules (objects inside arrays join the graph too);
+ *    array keys are interned persistently;
+ *  - everything else is rejected with the property path in the message: closures,
+ *    resources, references, internal classes, enums, objects with dynamic properties,
+ *    lazy objects, objects whose handlers are not the engine's std_object_handlers, and
+ *    objects that are already persistent (a clone from another persist() call - graphs
+ *    do not share objects, persist a single root instead).
  *
- * After conversion a byte snapshot of the finished properties_table is taken: detach()
- * restores it at request shutdown, which gives persisted objects frozen semantics
+ * After conversion a byte snapshot of every finished properties_table is taken: detach()
+ * restores them at request shutdown, which gives persisted graphs frozen semantics
  * (request-time mutations do not survive - see README).
  */
 final class Persister
 {
-    public function persistObject(object $source): PersistedEntry
-    {
-        $this->assertPersistableObject($source);
+    /**
+     * Cycle/diamond map of the graph walk: source zend_object address => persistent clone
+     *
+     * @var array<int, CData>
+     */
+    private array $cloneByAddress = [];
 
-        $sourceValue = new ReflectionValue($source);
-        $rawSource   = $sourceValue->getRawObject();
+    /** @var list<CData> Persistent clones in discovery order, index 0 = root */
+    private array $clones = [];
 
-        if (!PersistentObjectFactory::usesStandardHandlers($rawSource)) {
-            $sourceValue->release();
-            throw NotPersistableException::forValue(
-                '$root',
-                'object handlers differ from std_object_handlers (internal or hooked class)',
-            );
-        }
-        if ($rawSource->extra_flags !== 0) {
-            $sourceValue->release();
-            throw NotPersistableException::forValue('$root', 'object carries engine extra_flags (lazy object?)');
-        }
+    /** @var list<string> Class name per clone */
+    private array $classNames = [];
 
-        $clone = PersistentObjectFactory::persistentClone($rawSource);
-        $sourceValue->release();
-
-        $className = \get_class($source);
-        $signature = self::computeSignature($clone->ce);
-
-        // Convert every inline property slot of the CLONE in place; the source object
-        // is never touched
-        $propertyNames = self::declaredPropertyNames($clone->ce);
-        $tableBase     = Core::cast('zval *', Core::addr($clone->properties_table[0]));
-        foreach ($propertyNames as $index => $propertyName) {
-            $this->persistValueInPlace(Core::addr($tableBase[$index]), '$root::$' . $propertyName);
-        }
-
-        // Frozen-state snapshot of the finished persistent properties_table
-        $tableSize = \count($propertyNames) * Core::sizeof(Core::type('zval'));
-        if ($tableSize > 0) {
-            $snapshot = Core::trackedNew("char[{$tableSize}]", true);
-            Core::memcpy($snapshot, Core::cast('char *', $tableBase), $tableSize);
-        } else {
-            // Even a property-less object needs a non-null anchor buffer
-            $snapshot = Core::trackedNew('char[1]', true);
-        }
-
-        return new PersistedEntry($clone, Core::cast('char *', $snapshot), $className, $signature);
-    }
+    /** @var list<string> Layout signature per clone */
+    private array $signatures = [];
 
     /**
-     * Rejects whole categories of objects that can never be made persistent
+     * Converts the object graph reachable from $source into a persistent graph entry
      */
-    private function assertPersistableObject(object $source): void
+    public function persistObject(object $source): PersistedEntry
     {
-        $reflection = new \ReflectionObject($source);
+        $this->resetGraphState();
 
-        if ($reflection->isInternal()) {
-            throw NotPersistableException::forValue('$root', 'internal classes carry C state that cannot be persisted');
-        }
-        if ($reflection->isEnum()) {
-            throw NotPersistableException::forValue('$root', 'enum cases have per-request identity');
-        }
-        foreach ($reflection->getProperties() as $property) {
-            if (!$property->isDefault()) {
-                throw NotPersistableException::forValue(
-                    '$root::$' . $property->getName(),
-                    'dynamic properties are not supported - declare the property on the class',
-                );
+        try {
+            $sourceValue = new ReflectionValue($source);
+            try {
+                $this->persistGraphObject($sourceValue->getRawObject(), $source, '$root');
+            } finally {
+                $sourceValue->release();
             }
+
+            // Snapshots are taken only after the whole graph is converted: with cycles a
+            // slot may still be written while an outer frame is converting its own object
+            $snapshots = [];
+            foreach ($this->clones as $clone) {
+                $snapshots[] = self::snapshotProperties($clone);
+            }
+
+            return new PersistedEntry($this->clones, $snapshots, $this->classNames, $this->signatures);
+        } finally {
+            $this->resetGraphState();
         }
     }
 
@@ -125,6 +109,103 @@ final class Persister
         ];
 
         return sha1(implode('|', $parts));
+    }
+
+    /**
+     * Converts one graph object, or returns the clone minted for it earlier
+     *
+     * @param CData  $rawObject zend_object* of the SOURCE object (the map key)
+     * @param object $instance  PHP instance of the same object, for class-level reflection
+     * @param string $path      Property path of this object, for error messages
+     *
+     * @return CData zend_object* of the persistent clone
+     */
+    private function persistGraphObject(CData $rawObject, object $instance, string $path): CData
+    {
+        $address = Core::addressOf($rawObject);
+        if (isset($this->cloneByAddress[$address])) {
+            // Already seen: diamond edges converge and cycles terminate right here
+            return $this->cloneByAddress[$address];
+        }
+
+        $this->assertPersistableObject($rawObject, $instance, $path);
+
+        $clone = PersistentObjectFactory::persistentClone($rawObject);
+
+        // Registered BEFORE any slot is converted - a self-reference discovered below
+        // must resolve to this very clone instead of recursing forever
+        $this->cloneByAddress[$address] = $clone;
+        $this->clones[]                 = $clone;
+        $this->classNames[]             = \get_class($instance);
+        $this->signatures[]             = self::computeSignature($clone->ce);
+
+        // Convert every inline property slot of the CLONE in place; the source object
+        // is never touched
+        $tableBase = Core::cast('zval *', Core::addr($clone->properties_table[0]));
+        foreach (self::declaredPropertyNames($clone->ce) as $index => $propertyName) {
+            $this->persistValueInPlace(Core::addr($tableBase[$index]), $path . '::$' . $propertyName);
+        }
+
+        return $clone;
+    }
+
+    /**
+     * Rejects whole categories of objects that can never be made persistent
+     */
+    private function assertPersistableObject(CData $rawObject, object $instance, string $path): void
+    {
+        // Checked first: a persistent clone passes the handler check and would otherwise
+        // be reported through the extra_flags branch, which explains nothing
+        if (($rawObject->gc->u->type_info & Core::engineConstant('GC_PERSISTENT')) !== 0) {
+            throw NotPersistableException::forValue(
+                $path,
+                'object is already persistent - cross-graph sharing of persisted objects is not supported; '
+                . 'persist a single graph root',
+            );
+        }
+
+        $reflection = new \ReflectionObject($instance);
+        if ($reflection->isInternal()) {
+            throw NotPersistableException::forValue($path, 'internal classes carry C state that cannot be persisted');
+        }
+        if ($reflection->isEnum()) {
+            throw NotPersistableException::forValue($path, 'enum cases have per-request identity');
+        }
+        foreach ($reflection->getProperties() as $property) {
+            if (!$property->isDefault()) {
+                throw NotPersistableException::forValue(
+                    $path . '::$' . $property->getName(),
+                    'dynamic properties are not supported - declare the property on the class',
+                );
+            }
+        }
+        if (!PersistentObjectFactory::usesStandardHandlers($rawObject)) {
+            throw NotPersistableException::forValue(
+                $path,
+                'object handlers differ from std_object_handlers (internal or hooked class)',
+            );
+        }
+        if ($rawObject->extra_flags !== 0) {
+            throw NotPersistableException::forValue($path, 'object carries engine extra_flags (lazy object?)');
+        }
+    }
+
+    /**
+     * Captures the frozen byte image of an object's finished properties_table
+     */
+    private static function snapshotProperties(CData $object): CData
+    {
+        $tableSize = $object->ce->default_properties_count * Core::sizeof(Core::type('zval'));
+        if ($tableSize > 0) {
+            $snapshot  = Core::trackedNew("char[{$tableSize}]", true);
+            $tableBase = Core::cast('char *', Core::addr($object->properties_table[0]));
+            Core::memcpy($snapshot, $tableBase, $tableSize);
+        } else {
+            // Even a property-less object needs a non-null anchor buffer
+            $snapshot = Core::trackedNew('char[1]', true);
+        }
+
+        return Core::cast('char *', $snapshot);
     }
 
     /**
@@ -162,7 +243,7 @@ final class Persister
     }
 
     /**
-     * Converts one zval slot into a persistent-safe payload, recursing into arrays
+     * Converts one zval slot into a persistent-safe payload, recursing into arrays and objects
      */
     private function persistValueInPlace(CData $slot, string $path): void
     {
@@ -191,10 +272,9 @@ final class Persister
                 return;
 
             case ReflectionValue::IS_OBJECT:
-                throw NotPersistableException::forValue(
-                    $path,
-                    'nested objects (including closures) are not supported yet - flatten the state or persist them separately',
-                );
+                $this->persistObjectSlot($slot, $path);
+
+                return;
 
             case ReflectionValue::IS_RESOURCE:
                 throw NotPersistableException::forValue($path, 'resources cannot outlive the request');
@@ -205,6 +285,37 @@ final class Persister
             default:
                 throw NotPersistableException::forValue($path, "unsupported zval type {$type}");
         }
+    }
+
+    /**
+     * Retargets an object slot at the persistent clone of the referenced object
+     *
+     * The slot lives in a clone's byte-copied properties_table (or in a temporary while an
+     * array is rebuilt): it never took a reference on the source object, so retargeting it
+     * needs no refcounting. The refcounted IS_OBJECT_EX type_info is kept as-is - request
+     * code must be able to copy the value around normally, and the clone's refcount pin
+     * absorbs every addref/delref it will ever see.
+     */
+    private function persistObjectSlot(CData $slot, string $path): void
+    {
+        $rawObject = $slot->value->obj;
+        // A PHP instance is required for class-level reflection; the temporary reference
+        // it holds is dropped again when this frame returns
+        $instance = self::instanceOfRawObject($rawObject);
+
+        $slot->value->obj = $this->persistGraphObject($rawObject, $instance, $path);
+    }
+
+    /**
+     * Materializes the PHP instance of a live zend_object (balanced: +1 ref held by the return value)
+     */
+    private static function instanceOfRawObject(CData $rawObject): object
+    {
+        $value = ReflectionValue::newEntry(ReflectionValue::IS_OBJECT, $rawObject[0]);
+        $value->getNativeValue($instance);
+        $value->release();
+
+        return $instance;
     }
 
     /**
@@ -263,5 +374,16 @@ final class Persister
         $target->markImmutable();
 
         return $target;
+    }
+
+    /**
+     * Drops the per-call graph state (the converter is reusable and re-entrant per call)
+     */
+    private function resetGraphState(): void
+    {
+        $this->cloneByAddress = [];
+        $this->clones         = [];
+        $this->classNames     = [];
+        $this->signatures     = [];
     }
 }
