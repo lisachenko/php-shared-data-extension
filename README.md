@@ -10,7 +10,7 @@ Two features, one persistent module:
    fixed-size tables. See `demo.php`.
 2. **Persistent PHP objects**: full PHP objects whose state survives the request
    boundary, like interned strings do — held in a persistent object table with a
-   pinned refcount so the engine never reclaims them. See `demo-objects.php`.
+   pinned refcount so the engine never reclaims them. See `demos/demo-objects.php`.
 
 ## Persistent objects in 30 seconds
 
@@ -119,7 +119,7 @@ $store->detach(): void;                // runs automatically at request shutdown
 composer install
 vendor/bin/phpunit                     # unit + lifecycle tests
 php -d ffi.enable=1 tools/soak.php     # 5k attach/mutate/detach cycles, flat-memory gate
-php -d ffi.enable=1 demo-objects.php
+php -d ffi.enable=1 demos/demo-objects.php
 php -d ffi.enable=1 demo.php           # original shared C data demo
 ```
 

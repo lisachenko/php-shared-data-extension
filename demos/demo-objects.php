@@ -14,7 +14,7 @@
 use Lisachenko\SharedData\PersistentStore;
 use ZEngine\Core;
 
-include __DIR__ . '/vendor/autoload.php';
+include __DIR__ . '/../vendor/autoload.php';
 
 Core::init();
 
