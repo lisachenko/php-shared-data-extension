@@ -3,7 +3,7 @@
     "description": "Shared data extension for PHP: persistent memory and request-surviving objects",
     "type": "library",
     "require": {
-        "lisachenko/z-engine": "dev-claude/php-object-request-persistence-uos3tu || dev-master",
+        "lisachenko/z-engine": "dev-master",
         "php": "~8.4.0",
         "ext-ffi": "*"
     },
