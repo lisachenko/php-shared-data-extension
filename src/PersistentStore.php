@@ -332,10 +332,13 @@ final class PersistentStore
             $objectEntry = ObjectEntry::fromCData($object->object);
 
             // Release the request-allocated properties hashtable rebuilt by
-            // get_object_vars()/var_dump()/casts, it would dangle next request
+            // get_object_vars()/var_dump()/casts, it would dangle next request.
+            // fromCData() is the BORROWED view over this engine-owned table - plain
+            // construction mints a NEW owned table instead (z-engine 8.4.0), which
+            // would leak the fresh table and never release the object's own one.
             $dynamicProperties = $objectEntry->getDynamicPropertiesPointer();
             if ($dynamicProperties !== null) {
-                (new HashTable($dynamicProperties))->releaseReference();
+                HashTable::fromCData($dynamicProperties)->releaseReference();
                 $objectEntry->setDynamicPropertiesPointer(null);
             }
         }
