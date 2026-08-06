@@ -97,9 +97,9 @@ final class Registry
      */
     public static function create(): array
     {
-        $root = PersistentHashTable::create();
-        self::addPointer($root, 'entries', PersistentHashTable::create()->getRawValue());
-        self::addPointer($root, 'objects', PersistentHashTable::create()->getRawValue());
+        $root = new PersistentHashTable();
+        self::addPointer($root, 'entries', new PersistentHashTable()->getRawValue());
+        self::addPointer($root, 'objects', new PersistentHashTable()->getRawValue());
 
         return [new self($root), Core::addressOf($root->getRawValue())];
     }
@@ -121,12 +121,12 @@ final class Registry
             $this->adjustShares($address, +1);
         }
 
-        $members = PersistentHashTable::create();
+        $members = new PersistentHashTable();
         foreach ($entry->members as $index => $address) {
             self::addLong($members, $index, $address);
         }
 
-        $meta = PersistentHashTable::create();
+        $meta = new PersistentHashTable();
         self::addLong($meta, 'count', $entry->count());
         self::addPointer($meta, 'members', $members->getRawValue());
 
@@ -272,12 +272,12 @@ final class Registry
      */
     private function addObject(PersistedObject $object): void
     {
-        $arrays = PersistentHashTable::create();
+        $arrays = new PersistentHashTable();
         foreach ($object->arrays as $index => $array) {
             self::addPointer($arrays, $index, $array);
         }
 
-        $meta = PersistentHashTable::create();
+        $meta = new PersistentHashTable();
         self::addPointer($meta, 'object', $object->object);
         self::addPointer($meta, 'snapshot', $object->snapshot);
         self::addInternedString($meta, 'class', $object->className);
