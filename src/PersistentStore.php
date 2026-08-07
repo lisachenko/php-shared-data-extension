@@ -16,7 +16,6 @@ namespace Lisachenko\SharedData;
 use FFI\CData;
 use ZEngine\Core;
 use ZEngine\Reflection\ReflectionValue;
-use ZEngine\Type\HashTable;
 use ZEngine\Type\ObjectEntry;
 use ZEngine\Type\PersistentObjectFactory;
 
@@ -332,10 +331,16 @@ final class PersistentStore
             $objectEntry = ObjectEntry::fromCData($object->object);
 
             // Release the request-allocated properties hashtable rebuilt by
-            // get_object_vars()/var_dump()/casts, it would dangle next request
+            // get_object_vars()/var_dump()/casts, it would dangle next request.
+            // Mirrors zend_array_release(): drop our reference, and let the
+            // engine dismantle the table through its own allocator at zero
             $dynamicProperties = $objectEntry->getDynamicPropertiesPointer();
             if ($dynamicProperties !== null) {
-                (new HashTable($dynamicProperties))->releaseReference();
+                $gcHeader           = $dynamicProperties->gc;
+                $gcHeader->refcount = $gcHeader->refcount - 1;
+                if ($gcHeader->refcount === 0) {
+                    Core::call('rc_dtor_func', Core::cast('zend_refcounted *', $dynamicProperties));
+                }
                 $objectEntry->setDynamicPropertiesPointer(null);
             }
         }

@@ -410,7 +410,7 @@ final class Persister
      */
     private function persistArray(CData $sourceArray, string $path): PersistentHashTable
     {
-        $target = PersistentHashTable::create();
+        $target = new PersistentHashTable();
 
         // Ownership is recorded up front: elements converted below may mint nested tables,
         // and they all belong to the same object - the one whose slot started this array
