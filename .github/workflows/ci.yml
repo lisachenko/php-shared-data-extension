@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.4']
+        php: ['8.4', '8.5']
     steps:
       - uses: actions/checkout@v4
 
@@ -33,14 +33,18 @@ jobs:
         run: vendor/bin/phpunit
 
   soak:
-    name: Flat-memory soak (5k request cycles)
+    name: Flat-memory soak (5k request cycles, PHP ${{ matrix.php }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4', '8.5']
     steps:
       - uses: actions/checkout@v4
 
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.4'
+          php-version: ${{ matrix.php }}
           extensions: ffi
           ini-values: ffi.enable=1, opcache.jit=off
           coverage: none
@@ -52,14 +56,18 @@ jobs:
         run: php -d ffi.enable=1 tools/soak.php 5000
 
   soak-drop:
-    name: Reclaiming soak (5k persist/drop cycles)
+    name: Reclaiming soak (5k persist/drop cycles, PHP ${{ matrix.php }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4', '8.5']
     steps:
       - uses: actions/checkout@v4
 
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.4'
+          php-version: ${{ matrix.php }}
           extensions: ffi
           ini-values: ffi.enable=1, opcache.jit=off
           coverage: none
@@ -71,14 +79,18 @@ jobs:
         run: php -d ffi.enable=1 tools/soak-drop.php 5000
 
   request-boundary:
-    name: True multi-request gate (php-cgi/FastCGI)
+    name: True multi-request gate (php-cgi/FastCGI, PHP ${{ matrix.php }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4', '8.5']
     steps:
       - uses: actions/checkout@v4
 
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.4'
+          php-version: ${{ matrix.php }}
           extensions: ffi
           ini-values: ffi.enable=1, opcache.jit=off
           coverage: none
