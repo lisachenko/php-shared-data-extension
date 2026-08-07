@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lisachenko/php-shared-data-extension/actions/workflows/ci.yml/badge.svg)](https://github.com/lisachenko/php-shared-data-extension/actions/workflows/ci.yml)
 [![Latest Version](https://img.shields.io/packagist/v/lisachenko/php-shared-data-extension?include_prereleases)](https://packagist.org/packages/lisachenko/php-shared-data-extension)
-[![PHP 8.4](https://img.shields.io/badge/php-8.4-777BB3.svg?logo=php&logoColor=white)](composer.json)
+[![PHP 8.4 | 8.5](https://img.shields.io/badge/php-8.4%20%7C%208.5-777BB3.svg?logo=php&logoColor=white)](composer.json)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **PHP objects that survive the request boundary. In pure PHP.**
@@ -263,9 +263,7 @@ CI runs all of the above on every push and pull request.
 
 ## Requirements
 
-- PHP ~8.4 (NTS) with `ext-ffi`
-- `lisachenko/z-engine` — temporarily pinned to the
-  `claude/shared-objects-dag-memory-nq462w` branch, which adds the persistent
-  free primitives (`Core::persistentFree()`, `PersistentHashTable::destroy()`,
-  `HashTable::deleteIndex()`) this release needs; back to `dev-master` (or the
-  `8.4` release line once tagged) as soon as that lands
+- PHP 8.4 or 8.5 (NTS) with `ext-ffi`
+- `lisachenko/z-engine` — required as `8.4.x-dev || 8.5.x-dev`; z-engine tracks
+  one PHP minor per line, and Composer resolves the line matching the running
+  PHP (the `8.4` branch on PHP 8.4, `master` — aliased `8.5.x-dev` — on PHP 8.5)

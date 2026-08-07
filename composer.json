@@ -3,8 +3,8 @@
     "description": "Shared data extension for PHP: persistent memory and request-surviving objects",
     "type": "library",
     "require": {
-        "lisachenko/z-engine": "dev-master || ^8.4",
-        "php": "~8.4.0",
+        "lisachenko/z-engine": "8.4.x-dev || 8.5.x-dev",
+        "php": "^8.4",
         "ext-ffi": "*"
     },
     "require-dev": {
