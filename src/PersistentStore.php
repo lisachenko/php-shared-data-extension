@@ -633,6 +633,18 @@ final class PersistentStore
     }
 
     /**
+     * The object-store handle THIS process holds for a shared object, if it registered it
+     *
+     * The value the shared struct deliberately no longer carries. Two processes routinely hold
+     * different numbers for the same object - and, because they inherit one free list, the
+     * same number for different objects - which is the whole reason it lives here.
+     */
+    public function processHandleOf(int $address): ?int
+    {
+        return $this->sideTable->handleOf($address);
+    }
+
+    /**
      * Whether this store's state lives in a fork-shared arena
      */
     public function isShared(): bool
@@ -1007,6 +1019,15 @@ final class PersistentStore
      * call and the sentinel is restored afterwards. A refusal is not an error - it means the
      * slot was meanwhile reused, and refusing to recycle somebody else's slot is the guard
      * doing its job.
+     *
+     * That restore is the ONE moment the shared field is not the sentinel, and it is visible
+     * to siblings: a process calling spl_object_id() on a shared object while another one is
+     * detaching may see that other process's handle instead. The window is a few instructions
+     * wide and cannot be locked away - recycling a store slot is an engine call, and engine
+     * calls are forbidden under an arena mutex. It is harmless because nothing in this package
+     * ever reads that field (every path goes through the side table), and it is the reason the
+     * sentinel is documented as "do not trust this field" rather than "this field is always
+     * the sentinel". Identity is sharedIdOf(), always.
      */
     private function releaseHandle(CData $object, int $handle): void
     {

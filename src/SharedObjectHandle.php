@@ -262,6 +262,97 @@ final class SharedObjectHandle
     }
 
     /**
+     * Writes several scalar properties in ONE critical section
+     *
+     * The multi-slot half of the contract: a reader that takes the same lock either sees all
+     * of these values or none of them. Writing them one by one would publish a half-applied
+     * update between the calls - which is exactly what the sweep observed at the PHP level in
+     * 2.7-3.8 % of unlocked reads of a three-property update.
+     *
+     * @param array<string, int|float|bool|null> $values Property name => value
+     */
+    public function writeScalars(array $values): void
+    {
+        $writes = [];
+        foreach ($values as $property => $value) {
+            $value = $this->assertAssignable($property, $value);
+            $view  = $this->viewOf($property);
+
+            $writes[] = match (true) {
+                $value === null  => [$view, ReflectionValue::IS_NULL, 0, false],
+                $value === true  => [$view, ReflectionValue::IS_TRUE, 0, false],
+                $value === false => [$view, ReflectionValue::IS_FALSE, 0, false],
+                \is_int($value)  => [$view, ReflectionValue::IS_LONG, $value, false],
+                default          => [$view, ReflectionValue::IS_DOUBLE, $value, true],
+            };
+        }
+
+        $recovered = $this->arena->lockStripe($this->stripe);
+
+        foreach ($writes as [$view, $typeInfo, $payload, $isDouble]) {
+            if ($isDouble) {
+                $view['doubles'][0] = $payload;
+            } else {
+                $view['words'][0] = $payload;
+            }
+            $view['types'][2] = $typeInfo;
+        }
+
+        $this->arena->unlockStripe($this->stripe);
+
+        $this->recoveredLock = $this->recoveredLock || $recovered;
+    }
+
+    /**
+     * Reads several scalar properties in ONE critical section
+     *
+     * The counterpart of writeScalars(): the values come from a single generation of the
+     * object, which is the only way a caller can compare two slots and conclude anything.
+     *
+     * @param list<string> $properties
+     *
+     * @return array<string, int|float|bool|null>
+     */
+    public function readScalars(array $properties): array
+    {
+        $views = [];
+        foreach ($properties as $property) {
+            $views[$property] = $this->viewOf($property);
+        }
+
+        $raw = [];
+
+        $recovered = $this->arena->lockStripe($this->stripe);
+
+        foreach ($views as $property => $view) {
+            $raw[$property] = [(int) $view['types'][2] & 0xFF, (int) $view['words'][0], (float) $view['doubles'][0]];
+        }
+
+        $this->arena->unlockStripe($this->stripe);
+
+        $this->recoveredLock = $this->recoveredLock || $recovered;
+
+        $values = [];
+        foreach ($raw as $property => [$type, $lval, $dval]) {
+            $values[$property] = match ($type) {
+                ReflectionValue::IS_UNDEF, ReflectionValue::IS_NULL => null,
+                ReflectionValue::IS_TRUE   => true,
+                ReflectionValue::IS_FALSE  => false,
+                ReflectionValue::IS_LONG   => $lval,
+                ReflectionValue::IS_DOUBLE => $dval,
+                default => throw SharedMutationException::unexpectedSlotType(
+                    $this->className,
+                    $property,
+                    'scalar',
+                    $type,
+                ),
+            };
+        }
+
+        return $values;
+    }
+
+    /**
      * Interns new bytes in the arena and swaps the 8-byte string pointer under the lock
      *
      * The old block is NOT freed: the arena is bump-allocated and a sibling may be holding
