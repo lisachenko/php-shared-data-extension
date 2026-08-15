@@ -188,6 +188,27 @@ final class ArenaException extends \RuntimeException
         ));
     }
 
+    /**
+     * A free path was reached with a block that lives in the fork-shared arena
+     *
+     * The arena is bump-allocated: blocks are never handed back one by one, and the region
+     * dies as a whole with the process that created it. A free() here would be a free() of
+     * memory this process's heap never allocated - and in a forked CHILD it would additionally
+     * be a free() of memory the parent and every sibling are still reading. Both are refused
+     * before anything is released rather than diagnosed afterwards.
+     */
+    public static function blockNotFreeable(string $what, int $address, bool $isCreator): self
+    {
+        return new self(sprintf(
+            'Refusing to free the %s at 0x%x: it lives in the fork-shared arena, which is bump-allocated ' .
+            'and reclaimed only when the creating process exits%s. Arena-backed graphs release their ' .
+            'registry bookkeeping without freeing memory - see Registry::removeObject().',
+            $what,
+            $address,
+            $isCreator ? '' : ', and this process is not the one that created it',
+        ));
+    }
+
     public static function released(): self
     {
         return new self('This arena has already been unmapped by its creating process');

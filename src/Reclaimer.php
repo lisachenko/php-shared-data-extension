@@ -14,6 +14,8 @@ declare(strict_types=1);
 namespace Lisachenko\SharedData;
 
 use FFI\CData;
+use Lisachenko\SharedData\Shm\Arena;
+use Lisachenko\SharedData\Shm\ArenaException;
 use ZEngine\Core;
 use ZEngine\Type\PersistentHashTable;
 
@@ -72,9 +74,56 @@ use ZEngine\Type\PersistentHashTable;
  * payloads cannot be checked that way (immutable arrays live in NON-refcounted zvals, so
  * copies leave no trace), which is why the README states that copies of a dropped entry's
  * arrays taken earlier in the same request must not be used after drop() returns.
+ *
+ * ## What must never reach this class: arena memory
+ *
+ * Everything above is about MALLOC memory owned by one process. A block in the fork-shared
+ * arena is the opposite of that in every respect - it is bump-allocated, it is read by every
+ * worker of the family, and it has no allocator that could take it back. The registry
+ * already routes arena-backed state past every call below, but that is a decision made at one
+ * call site, and a free of shared memory from a child is not the kind of mistake that
+ * announces itself: it corrupts the process heap of whoever calls it and leaves the siblings
+ * reading memory nobody owns.
+ *
+ * So the refusal lives HERE, at the last line before the free, and it is armed by the arena
+ * itself: PersistentStore::bootShared() protects its arena for the request, and every free
+ * path in this class then refuses any block inside it - in the creating process and in every
+ * child alike.
  */
 final class Reclaimer
 {
+    /**
+     * Arenas whose blocks must never be freed by this process, keyed by base address
+     *
+     * Request-scoped by nature (a PHP static), which is exactly right: each request boots its
+     * store again and re-arms the guard for the mapping it is actually using.
+     *
+     * @var array<int, Arena>
+     */
+    private static array $protected = [];
+
+    /**
+     * Arms the guard for one arena; idempotent, and safe to call on every boot
+     */
+    public static function protect(Arena $arena): void
+    {
+        self::$protected[$arena->baseAddress()] = $arena;
+    }
+
+    /**
+     * Whether an address belongs to an arena this process must not free from
+     */
+    public static function isProtected(int $address): bool
+    {
+        foreach (self::$protected as $arena) {
+            if ($arena->contains($address)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /**
      * Frees one persistent object with everything it exclusively owns
      *
@@ -119,6 +168,8 @@ final class Reclaimer
      */
     private static function destroyTable(CData $table): void
     {
+        self::assertFreeable($table, 'shared table');
+
         PersistentHashTable::fromCData($table)->destroy();
     }
 
@@ -127,10 +178,25 @@ final class Reclaimer
      */
     private static function freeBlock(CData $pointer): void
     {
+        self::assertFreeable($pointer, 'shared block');
+
         // Blocks persisted by an earlier request are not in the registry anymore, blocks
         // from THIS request are - and a stale entry pointing at freed memory would let a
         // later untrackAndFree() free a recycled address a second time
         Core::untrack($pointer);
         Core::persistentFree($pointer);
+    }
+
+    /**
+     * Refuses a block that lives in a protected arena, naming the role of this process
+     */
+    private static function assertFreeable(CData $pointer, string $what): void
+    {
+        $address = Core::addressOf($pointer);
+        foreach (self::$protected as $arena) {
+            if ($arena->contains($address)) {
+                throw ArenaException::blockNotFreeable($what, $address, $arena->isCreator());
+            }
+        }
     }
 }
