@@ -249,17 +249,50 @@ crash. Cross-process locking uses a bank of 64 `PTHREAD_PROCESS_SHARED | PTHREAD
 mutexes inside the arena, so a SIGKILLed worker hands the lock on (`EOWNERDEAD`) instead of
 wedging the pool.
 
-**Known limits of this first iteration** (all of them are what the per-process side table
-of the next iteration fixes, and all of them are spelled out on `bootShared()`):
+**Per-process engine state.** Three fields of a `zend_object` describe the process reading
+it, not the object, and they live in a per-process side table rather than in shared memory:
+the object-store `handle` (forked children inherit one free list and are handed *identical*
+numbers, so the shared field is overwritten with a sentinel and identity is
+`$store->sharedIdOf($object)` — the arena address), the class entry (rebound per process;
+classes must still be loaded **before the fork**, since a shared object carries one `ce` for
+the family), and the dynamic-property cache. That last one is written by engine C code on
+`get_object_vars()`, `var_dump()`, `json_encode()`, `(array)`, `serialize()`,
+`debug_zval_dump()` and `ReflectionObject` — a request-heap pointer deposited in shared
+memory — so it is forced `NULL` at attach and never dereferenced. Inspect a shared object
+through `$store->inspect($object, fn ($o) => var_dump($o))`, or call
+`$store->scrubProperties($object)` afterwards.
 
-- classes must be loaded **before the fork** — a shared object carries one class-entry
-  pointer for the whole family;
-- `spl_object_id()` is not meaningful on a shared object, and forked children even receive
-  identical object-store handles — the registry keys everything by arena address instead;
-- `get_object_vars()`, `var_dump()`, `json_encode()` and `(array)` casts make engine C code
-  cache a request-heap pointer inside the shared object; avoid them on shared instances;
-- frozen semantics still apply: request-time mutations are rolled back at request end.
-  Shared **mutable** state is the next ticket.
+### Shared mutation (opt-in per graph)
+
+By default a persisted graph is **frozen**: request-time mutations are rolled back at
+request end. Pass `mutable: true` and the graph keeps everything that makes a persistent
+clone safe — the refcount pin, `GC_PERSISTENT|GC_NOT_COLLECTABLE`, non-refcounted payloads,
+sealed arrays — and gives up the rollback, so what a worker writes stays written for the
+whole family:
+
+```php
+$counters = $store->persist(Counters::class, new Counters(), mutable: true);
+$handle   = $store->mutableHandle($counters);
+
+$handle->writeScalars(['hits' => 1, 'misses' => 0]);   // one critical section
+$handle->writeString('lastRoute', '/checkout');        // interned in the arena, pointer swapped
+$handle->writeReference('owner', $otherSharedObject);  // arena objects only
+
+[$hits, $misses] = array_values($handle->readScalars(['hits', 'misses']));
+```
+
+Every write takes the object's stripe mutex and does nothing inside it but store the payload
+word and then the type word; every value is validated and interned *before* the lock.
+Declared property types are enforced by the write path, because the engine never sees the
+assignment. What is refused: a plain-array slot (a shared `zend_array` can never grow — use
+`Ipc\SharedArray`), and a reference to an object that is not itself in this arena.
+
+A direct `$object->hits++` still compiles and still reaches shared memory — the extension
+rewires shared objects to `std_object_handlers`, so there is no write hook to intercept it.
+For scalars that is merely **unsynchronized** (visible everywhere, racy). For a string,
+array or object it stores a pointer into the writing process's request heap, which no
+sibling may follow: such a slot is restored from the persisted image at detach instead of
+being left behind. Use the handle for anything that has to be correct.
 
 Reader/writer contract for anything you build on the arena directly: a naturally aligned
 8-byte read never tears, but a 16-byte `zval` is two stores — readers take the same stripe

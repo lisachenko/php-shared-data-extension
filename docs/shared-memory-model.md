@@ -284,7 +284,8 @@ is the Never-Serialize Rule in one sentence.
 | Plain-array properties of shared objects are immutable | by design (§4); mutable collections are `Ipc\SharedArray` |
 | Arena memory is never reclaimed per block | v1 accounting (§6); a shared free list needs cross-process reachability data that nothing here can produce yet |
 | String rewrites leak the previous bytes | consequence of §6; a content-keyed persistent intern table is the next iteration |
-| Direct `$obj->prop = ...` writes are unsynchronized | by design: the extension rewires shared objects to `std_object_handlers`, so there is no write hook. Scalar writes are visible but racy; the synchronized path is the explicit write API |
+| Direct `$obj->prop = ...` writes are unsynchronized | by design: the extension rewires shared objects to `std_object_handlers`, so there is no write hook. Scalar writes are visible but racy; a string/array/object written that way stores a request-heap pointer and is restored from the persisted image at detach. The synchronized path is `PersistentStore::mutableHandle()` |
+| The shared `handle` field is not the sentinel for a few instructions while a process detaches | inherent: recycling an object-store slot is an engine call and engine calls cannot run under an arena mutex. Nothing in the package reads that field — identity is `sharedIdOf()` (§3) |
 | Post-fork closures cannot be shared | [#20] (§7) |
 | A borrowed `PersistentHashTable` view cannot re-adopt the external storage block it sits on, so the growth guard is re-derived in this package | z-engine seam follow-up; see the `TODO` in `Registry::assertRegistryRoom()` and [z-engine#223](https://github.com/lisachenko/z-engine/pull/223) |
 
