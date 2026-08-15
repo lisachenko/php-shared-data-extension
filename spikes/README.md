@@ -13,6 +13,7 @@ through Composer's autoloader and nothing else.
 ```bash
 php8.4 -d ffi.enable=1 -d opcache.jit=off spikes/s8-robust-pshared-mutex.php
 php8.4 -d ffi.enable=1 -d opcache.jit=off spikes/s15-concurrent-bump-allocation.php
+php8.4 -d ffi.enable=1 -d opcache.jit=off spikes/s17-prefork-closures.php
 ```
 
 ## Arena spikes (E1)
@@ -22,8 +23,18 @@ php8.4 -d ffi.enable=1 -d opcache.jit=off spikes/s15-concurrent-bump-allocation.
 | `s8-robust-pshared-mutex.php` | Do the arena's `PTHREAD_PROCESS_SHARED` + `PTHREAD_MUTEX_ROBUST` mutexes exclude another process, survive a SIGKILLed owner (`EOWNERDEAD` → `pthread_mutex_consistent`) and stay usable afterwards? | GREEN — all three |
 | `s15-concurrent-bump-allocation.php` | Four children, 8000 blocks through one shared bump cursor: any overlap, any block written through by a foreign process? | GREEN — zero overlaps, zero foreign markers |
 
-Both run against this package's own `Arena`, so they double as end-to-end checks of the
-class the rest of the epic builds on.
+## Closure spikes (E5)
+
+| File | Question | Verdict |
+|---|---|---|
+| `s17-prefork-closures.php` | Can four children invoke closures registered before the fork barrier, by address, with correct results — and are the two ways of getting it wrong (registering after the barrier, registering from a worker) refused rather than resolved? | GREEN — 13 checks, both minors |
+
+All three run against this package's own `Arena`, so they double as end-to-end checks of the
+classes the rest of the epic builds on. `s17` is the mechanism that came out of the original
+S17 experiment rather than the experiment itself: the sweep held **post-fork** addresses on
+purpose and found a valid `Closure` of a different function behind one, which is why nothing
+here validates a closure by inspecting it. The Phase B verdict that experiment leads to is
+written up in [docs/closure-cloning.md](../docs/closure-cloning.md).
 
 ## The wider validation sweep (not in this repository)
 
@@ -52,7 +63,7 @@ The findings that bind the implementation, restated here so the code has somethi
   never by handle. Moving those fields into a per-process side table is E2's job (#17); until
   then arena mode carries the limitations listed in `PersistentStore::bootShared()`.
 - **S16/S17** — arena-interned strings swap safely under a pointer store; closures are only
-  fork-safe when they existed before the fork (E5).
+  fork-safe when they existed before the fork (E5, shipped as `Ipc\ClosureProvenance`).
 
 The claims that this package depends on are not left resting on that sweep: S12/S14/S16 are
 promoted to real tests in `tests/Shm/` (mutation visibility, per-process side table, unlocked
