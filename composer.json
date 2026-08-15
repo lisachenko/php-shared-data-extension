@@ -34,13 +34,6 @@
     "prefer-stable": true,
     "repositories": [
         {
-            "type": "path",
-            "url": "../z-engine",
-            "options": {
-                "symlink": true
-            }
-        },
-        {
             "type": "vcs",
             "url": "https://github.com/lisachenko/z-engine"
         }
