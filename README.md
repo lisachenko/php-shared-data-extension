@@ -264,6 +264,65 @@ Reader/writer contract for anything you build on the arena directly: a naturally
 mutex as the writer whenever a value's *type* can change or more than one slot participates.
 The evidence for every claim in this section is in `spikes/`.
 
+### IPC primitives in the arena (experimental)
+
+Shared memory answers "where does the value live"; it says nothing about "whose turn is it"
+and "is it there yet". `Lisachenko\SharedData\Ipc` adds the primitives that do, and they are
+themselves structures in the arena — a channel, an array, a mutex, a counter, a wait group
+and a table of result slots, all found by address (or by a name in the arena roots
+directory) rather than inherited as PHP state.
+
+```php
+use Lisachenko\SharedData\Ipc\{SharedChannel, ResultSlotTable, ValueCodec, WakeRegistry};
+use Lisachenko\SharedData\Shm\{Arena, ArenaAllocator};
+
+$arena     = Arena::create();
+$store     = PersistentStore::bootShared($arena);
+$allocator = new ArenaAllocator($arena);
+$codec     = new ValueCodec($allocator, $store);
+$wake      = WakeRegistry::create($arena);              // socket pairs, created PRE-FORK
+$jobs      = SharedChannel::create($allocator, $codec, $wake, 64, name: 'jobs');
+$results   = ResultSlotTable::create($allocator, $codec, $wake, 1024);
+
+$slot = $results->allocateSlot();
+if (pcntl_fork() === 0) {
+    [$job, $ok] = $jobs->recv();                        // parks on the socket, wakes on an event
+    $results->complete($slot, process($job));           // writes a record, pokes the waiter
+    exit(0);
+}
+$jobs->send($sharedObject);                             // an address, never a copy
+$value = $results->await($slot)->value;                 // read straight out of shared memory
+```
+
+Values move as **16-byte records**: `uint8 tag | 7 pad | uint64 payload`, where the payload
+is the value itself (`int`, `float`, nothing at all for `null`/`bool`) or an arena address
+(an interned `zend_string`, a shared `zend_object`, a `SharedArray`). A value with no
+address-shaped form — a plain array, a resource, a closure, an object this family does not
+share — is refused with `NotShareableValueException` naming the remedy. Nothing is ever
+encoded: there is no `serialize()`, igbinary or JSON on any data path, and the test suite
+proves it by shadowing every encoding function in the package's namespaces.
+
+The sockets carry **only** fixed 16-byte event records `{opcode, tag, slot/channel id,
+address}` — signalling, never payload; a scalar's record carries a zero where an address
+would be. Waking is level-triggered: a waiter registers in the structure's waiter table and
+re-checks the state inside the same critical section, so a wakeup can be spurious but never
+lost, and every blocking loop also re-polls on a bounded slice.
+
+| Primitive | What it is |
+|---|---|
+| `SharedChannel` | ring of records + waiter tables under a dedicated robust mutex; capacity 0 is a true cross-process rendezvous; `close()` crosses processes (receivers drain, then `[null, false]`; senders throw) |
+| `SharedArray` | fixed-capacity vector of records, `ArrayAccess`/`Countable`/`IteratorAggregate`, stripe-locked |
+| `ResultSlotTable` | futures: `allocateSlot()` / `complete()` / `completePanic()` / `await()`, with panics travelling as a shared `SharedError` object |
+| `SharedMutex` | robust process-shared mutex with trylock-and-backoff, `EOWNERDEAD` recovered and reported |
+| `AtomicInt` | one shared cell: plain aligned get/set, stripe-locked `add()`/`compareAndSet()` |
+| `SharedWaitGroup` | counter plus waiter table; `add()`/`done()`/`wait()`, negative counts throw |
+| `WakeRegistry` | one inherited socket pair per process, the notification plane everything parks on |
+
+Blocking here is a spin loop over the notification descriptor, which is the honest primitive
+a package with no scheduler can offer: every primitive also exposes its non-blocking half
+(`trySend()`/`tryRecv()`/`tryLock()`/`readSlot()`) plus `notificationStream()`, so a
+coroutine runtime can park a Fiber in its own event loop instead.
+
 ### Deployment model
 
 - **Scope: one worker process.** This is per-process persistent memory, not
@@ -315,6 +374,18 @@ $store->addressOf(User::class): ?int;      // the eight bytes that travel betwee
 $store->attachObject($address): object;    // the receiving half, in any process of the family
 $arena->watermark(): int;                  // arena bytes handed out so far
 $arena->contains($address, $length): bool; // is this pointer still shared memory?
+
+// IPC primitives (all of them live in the arena; every one has a non-blocking half)
+$wake    = WakeRegistry::create($arena);              // pre-fork; sockets are inherited
+$channel = SharedChannel::create($allocator, $codec, $wake, $capacity);
+$channel->send($value, $timeout): bool;               // trySend() never blocks
+$channel->recv($timeout): array;                      // [value, true] | [null, false]; tryRecv() too
+$channel->close(): void;                              // crosses processes, drains first
+$channel->notificationStream();                       // park your own event loop on this
+$slots = ResultSlotTable::create($allocator, $codec, $wake, $capacity);
+$slots->allocateSlot(): int;
+$slots->complete($id, $value): void;                  // completePanic($id, SharedError::capture(...))
+$slots->await($id, $timeout): SlotResult;             // readSlot() never blocks
 ```
 
 ## Testing
