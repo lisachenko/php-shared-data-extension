@@ -17,9 +17,13 @@ namespace Lisachenko\SharedData\Ipc;
  * What the eight payload bytes of a value record mean
  *
  * The tag is the entire type system of the shared area: a value that crosses a worker
- * boundary is one of these nine shapes and nothing else. Three of them carry no payload at
- * all, two carry the value itself, three carry an ADDRESS inside the arena, and one is the
+ * boundary is one of these ten shapes and nothing else. Three of them carry no payload at
+ * all, two carry the value itself, four carry an ADDRESS inside the arena, and one is the
  * control tag channels use to publish their end of stream.
+ *
+ * The set is APPENDED to, never renumbered: the same numbers are the wire contract of the
+ * consumer runtime (`TaggedRecord` in native-php-coroutines), so a reader built against an
+ * older tag set still reads every record it knows and refuses the one it does not.
  *
  * Deliberately absent: any tag that would mean "a byte encoding of a PHP value graph".
  * Serialization is what the arena exists to avoid - see ValueCodec.
@@ -63,6 +67,16 @@ enum ValueTag: int
     case Close = 8;
 
     /**
+     * Payload is the address of a CLOSURE RECORD in the arena - never a closure itself
+     *
+     * The record is the arena-resident proof that the closure was registered before the fork
+     * barrier, which is the only provenance under which following a closure address is safe
+     * (EPIC #15, correction #8). The closure object itself stays where it was compiled, in
+     * memory the whole family inherited; see ClosureProvenance.
+     */
+    case Closure = 9;
+
+    /**
      * Whether the payload is an arena address rather than a value
      *
      * The notification plane uses this: an event record may carry the ADDRESS of a value
@@ -70,6 +84,6 @@ enum ValueTag: int
      */
     public function isAddress(): bool
     {
-        return $this === self::Str || $this === self::Obj || $this === self::Arr;
+        return $this === self::Str || $this === self::Obj || $this === self::Arr || $this === self::Closure;
     }
 }
