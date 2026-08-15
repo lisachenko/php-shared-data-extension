@@ -1,0 +1,26 @@
+=== S16 — string swap visibility ===
+PHP 8.4.19 (Linux), ZTS=no, pid=28852
+z-engine: booted (/home/user/z-engine)
+
+--- A — arena-intern two zend_strings
+      A at 0x7faa30e00400 (48 bytes) len=23 interned=true value=alpha-alpha-alpha-alpha
+      B at 0x7faa30e00600 (60 bytes) len=35 interned=true value=BRAVO-BRAVO-BRAVO-BRAVO-BRAVO-BRAVO
+[ OK ] A both strings readable from the arena
+      $name slot zval at 0x7faa30e01028 (value word 8-byte aligned: true)
+[ OK ] A2 property reads through the arena string :: 'alpha-alpha-alpha-alpha'
+
+--- B/C — 300000 pointer swaps by child 0; child 1 reads LOCKED, child 2 reads UNLOCKED
+      children: pid 28853 exit 0, pid 28854 exit 0, pid 28855 exit 0 (0.32 s)
+      LOCKED   reader: 267587 reads (A=135833 B=131754), 0 torn, max staleness 205.7 us
+      UNLOCKED reader: 2022502 reads, 0 torn pointers, 0 unexpected string values, max staleness 207.8 us
+[ OK ] B locked pointer swap: never torn, both values observed
+[ OK ] C UNLOCKED aligned 8-byte pointer swap: never torn either :: aligned 8-byte loads/stores are atomic on x86-64 — the lock buys ORDERING between slots, not per-pointer atomicity
+      parent reads $shared->name = 'alpha-alpha-alpha-alpha'
+
+--- D — control: the same 8-byte swap on a slot straddling a 4 KiB page boundary
+      slot at 0x7faa30e02ffc: offset % 4096 = 4092, offset % 64 = 60 — the 8 bytes span two pages
+      children: pid 28856 exit 0, pid 28857 exit 0
+      misaligned unlocked reader: 1811937 reads, 0 TORN values
+[ OK ] D misaligned (page-straddling) unlocked reads :: no tearing observed on this CPU, but the ISA gives no guarantee for a misaligned access — keep the alignment invariant
+
+Done.

@@ -202,6 +202,68 @@ graph in `tools/soak-drop.php`, against ~13 kB per cycle if nothing were
 reclaimed. A real content-keyed persistent intern table would remove this
 residue; it is the next iteration.
 
+### Fork-shared arena mode (opt-in, experimental)
+
+Everything above is **per-worker** memory: each FPM/RoadRunner process rebuilds its own
+copy. Arena mode removes that limit for a family of processes that descend from one
+parent. The state is persisted into a single `mmap(MAP_SHARED|MAP_ANONYMOUS)` region
+created **before the fork**, so every worker sees the very same objects at the very same
+addresses — no serialization, no cache round-trip, no copy.
+
+```php
+use Lisachenko\SharedData\PersistentStore;
+use Lisachenko\SharedData\Shm\Arena;
+
+$arena = Arena::create();                    // 64 MB by default, or SHARED_DATA_ARENA_SIZE
+$store = PersistentStore::bootShared($arena);
+
+$config = $store->persist(AppConfig::class, buildExpensiveConfig());
+$address = $store->addressOf(AppConfig::class);   // eight bytes that mean the same thing
+                                                  // in every process of the family
+for ($worker = 0; $worker < 4; $worker++) {
+    if (pcntl_fork() === 0) {
+        $childStore = PersistentStore::bootShared($arena);   // recovery, no globals write
+        $config     = $childStore->get(AppConfig::class);    // the SAME object, not a copy
+        // ... or attach an address a sibling sent over a socket:
+        // $object = $childStore->attachObject($address);
+        exit(0);
+    }
+}
+```
+
+What changes under the hood: every block the store mints — registry tables, object clones,
+frozen snapshots, interned strings, sealed arrays and their keys — comes out of the arena
+instead of malloc. The registry tables are **pre-sized and never grown**: the engine grows
+a full hashtable by reallocating its data block into the private heap of whichever worker
+filled it, writing that pointer into the shared struct *before* anything fails, so the
+tables refuse the insert with a typed `ArenaException` instead. Sizes come from
+`SHARED_DATA_ENTRY_CAPACITY` / `SHARED_DATA_OBJECT_CAPACITY`.
+
+The arena is bump-allocated and **leak-until-teardown**: blocks are never returned
+individually (`drop()` still removes entries and share-accounts them, it just does not free
+arena memory), and only the creating process unmaps the region, at shutdown. `watermark()`
+exposes exactly how much has been handed out, and exhaustion is a typed exception, never a
+crash. Cross-process locking uses a bank of 64 `PTHREAD_PROCESS_SHARED | PTHREAD_MUTEX_ROBUST`
+mutexes inside the arena, so a SIGKILLed worker hands the lock on (`EOWNERDEAD`) instead of
+wedging the pool.
+
+**Known limits of this first iteration** (all of them are what the per-process side table
+of the next iteration fixes, and all of them are spelled out on `bootShared()`):
+
+- classes must be loaded **before the fork** — a shared object carries one class-entry
+  pointer for the whole family;
+- `spl_object_id()` is not meaningful on a shared object, and forked children even receive
+  identical object-store handles — the registry keys everything by arena address instead;
+- `get_object_vars()`, `var_dump()`, `json_encode()` and `(array)` casts make engine C code
+  cache a request-heap pointer inside the shared object; avoid them on shared instances;
+- frozen semantics still apply: request-time mutations are rolled back at request end.
+  Shared **mutable** state is the next ticket.
+
+Reader/writer contract for anything you build on the arena directly: a naturally aligned
+8-byte read never tears, but a 16-byte `zval` is two stores — readers take the same stripe
+mutex as the writer whenever a value's *type* can change or more than one slot participates.
+The evidence for every claim in this section is in `spikes/`.
+
 ### Deployment model
 
 - **Scope: one worker process.** This is per-process persistent memory, not
@@ -245,13 +307,21 @@ $store->has(User::class): bool;
 $store->drop(User::class): bool;           // remove the entry + reclaim what nobody shares
 $store->objectCount(): int;                // live persistent clones (shared ones counted once)
 $store->detach(): void;                    // runs automatically at request shutdown
+
+// fork-shared arena mode (opt-in)
+$arena = Arena::create();                  // pre-fork, fixed size, leak-until-teardown
+$store = PersistentStore::bootShared($arena);
+$store->addressOf(User::class): ?int;      // the eight bytes that travel between workers
+$store->attachObject($address): object;    // the receiving half, in any process of the family
+$arena->watermark(): int;                  // arena bytes handed out so far
+$arena->contains($address, $length): bool; // is this pointer still shared memory?
 ```
 
 ## Testing
 
 ```bash
 composer install
-vendor/bin/phpunit                       # unit + lifecycle tests
+vendor/bin/phpunit                       # unit + lifecycle tests (forking arena suites included)
 php -d ffi.enable=1 tools/soak.php       # 5k attach/mutate/detach cycles, flat-memory gate
 php -d ffi.enable=1 tools/soak-drop.php  # 5k persist/attach/drop cycles, reclamation gate
 bash tools/request-boundary/run.sh 100   # real RINIT/RSHUTDOWN boundaries via php-cgi/FastCGI

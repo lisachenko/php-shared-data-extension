@@ -1,0 +1,35 @@
+=== S12 — cross-process mutation visibility ===
+PHP 8.5.9 (Linux), ZTS=no, pid=28889
+z-engine: booted (/tmp/claude-0/-home-user/75383dfd-1707-5f11-8f46-f7634c5ec618/scratchpad/spikes/lib/../zengine-85)
+
+arena: 0x7f2c2b400000 .. 0x7f2c2b800000 (4194304 bytes, MAP_SHARED|MAP_ANONYMOUS)
+
+--- A — 1000000 iterations, 1 writer child + 1 locked reader child + 1 UNLOCKED reader child
+children: pid 28890 exit 0, pid 28891 exit 0, pid 28892 exit 0   (1.25 s, 802988 writes/s)
+[ OK ] A1 locked reader: 977876 reads, 0 inconsistent observations
+      locked reader last observed generation 1000000 of 1000000 (progress proves visibility)
+[ OK ] A2 unlocked reader: 7466423 reads, 289045 value/mirror mismatches, 139907 value-vs-type mismatches :: EXPECTED: a 16-byte zval is NOT atomic; readers need the lock
+
+--- B1 — NEGATIVE CONTROL: persistent (malloc) clone + fork == copy-on-write
+      persistent clone at 0x562658b23680, object size 88 bytes (malloc/pemalloc heap)
+      child wrote counter=424242 (child read back 424242)
+[ OK ] B1 parent still sees counter=100 :: CONFIRMED: malloc memory is COW across fork — mutations are NOT shared
+
+--- B2 — THE PREMISE: byte-copy the engine-formatted object into MAP_SHARED and re-anchor
+      arena object at 0x7f2c2b401000, handle 36, spl_object_id=36, class=S12Holder
+[ OK ] B2 pre-fork read-back through the arena instance
+      children: pid 28894 exit 0, pid 28895 exit 0, pid 28896 exit 0 (0.23 s)
+      LOCKED reader:   178116 reads, 0 inconsistent, highest counter observed 200000 of 200000, max value age 106.9 us
+      UNLOCKED reader: 3064947 reads, 82000 inconsistent (2.68%)
+[ OK ] B2 cross-process visibility of engine property writes :: parent now reads counter=200000 ratio=50000.0 flag=false (written only by a child)
+[ OK ] B2 unlocked multi-property reads are inconsistent :: EXPECTED: multi-slot updates are not atomic — a reader must hold the same lock
+[ OK ] B2 parent observes the LAST child write :: expected 200000
+[ OK ] B2 arena object identity stable in parent
+
+--- C — child bump-allocates a NEW shared object POST-fork; the parent attaches it by address
+      child: pid 28897 exit 0; it published a 88-byte object at 0x7f2c2b411000 (8 bytes over the pipe, no serialization)
+      parent attached it: class=S12Holder counter=31337 ratio=2.5 flag=true
+[ OK ] C an object created by a child post-fork is readable by the parent
+      the child had already exited: only the arena bytes survive, and that is enough
+
+Done.

@@ -1,0 +1,39 @@
+=== S13 — pre-sized arData in shared memory ===
+PHP 8.5.9 (Linux), ZTS=no, pid=28901
+z-engine: booted (/tmp/claude-0/-home-user/75383dfd-1707-5f11-8f46-f7634c5ec618/scratchpad/spikes/lib/../zengine-85)
+
+arena 0x7f548f200000, sizeof(zend_array)=56, sizeof(Bucket)=32, sizeof(zval)=16
+
+--- A — build a 64-entry persistent table and relocate it into the arena
+      source table: flags=0x10 packed=false nTableSize=64 nNumUsed=64 nNumOfElements=64
+      nTableMask=-128  HT_HASH_SIZE=512  HT_DATA_SIZE=2048  one block of 2560 bytes at 0x556660e16430
+      arena table: struct at 0x7f548f200400, block at 0x7f548f201000, arData at 0x7f548f201200 (inside arena: true)
+      bucket KEYS still point at malloc-interned strings (COW-shared, fine across fork; see S16)
+--- B — materialize a PHP array zval pointing at the arena table
+      zval type_info = 0x7 (GC_IMMUTABLE => non-refcounted IS_ARRAY = 0x7)
+[ OK ] B count() :: got 64
+[ OK ] B lookup k7 :: 70
+[ OK ] B array_sum over foreach :: sum=20160
+[ OK ] B z-engine HashTable view count :: got 64
+--- C/D — 1 mutator child + 2 reader children, in-place scalar bucket overwrite under mutex
+      bucket[7].val zval at 0x7f548f2012e0
+      children: pid 28902 exit 0, pid 28903 exit 0, pid 28904 exit 0 (0.19 s)
+      value reader:      183516 locked reads, 0 anomalies, highest 200000 of 200000
+      structural reader: 112392 full foreach+count walks, 0 anomalies
+[ OK ] C concurrent foreach/count over a shared-memory table
+[ OK ] D in-place scalar bucket overwrite is visible cross-process
+[ OK ] D parent observes the last child write :: parent reads k7=200000 (expected 200000)
+
+--- E — THE TRAP: what happens when the table has to grow
+      arena2 0x7f548f100000 .. 0x7f548f200000; small table nTableSize=8 nNumUsed=6 arData=0x7f548f101040 (in arena: true)
+free(): invalid pointer
+      growth child: pid 28905 killed by signal 6 (SIGABRT)
+      the child never reported the move itself: it aborted inside the resize (see the signal above)
+      parent now reads ht->arData = 0x556660dbc410  (inside arena2: false)
+[ OK ] E growth is DETECTABLE (arData pointer changes in the shared struct) :: the shared struct was rewritten by the child
+[ OK ] E grown arData points OUTSIDE the shared arena :: the parent would now dereference the dead child's private heap: DANGLING
+      post-growth foreach child: pid 28906 exit 0
+      it walked 8 entries summing to 280; the shared struct claims nNumOfElements=8 nTableSize=16
+[ OK ] E a sibling reading the grown table gets SILENT garbage, not a crash :: walked 8 of the 8 elements the struct advertises — no fault, no signal, just wrong data
+
+Done.
