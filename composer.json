@@ -3,7 +3,7 @@
     "description": "Shared data extension for PHP: persistent memory and request-surviving objects",
     "type": "library",
     "require": {
-        "lisachenko/z-engine": "8.4.x-dev || 8.5.x-dev",
+        "lisachenko/z-engine": "dev-claude/php-coroutines-plan-5vovsz",
         "php": "^8.4",
         "ext-ffi": "*"
     },
@@ -31,5 +31,14 @@
         "test": "phpunit"
     },
     "minimum-stability": "dev",
-    "prefer-stable": true
+    "prefer-stable": true,
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../z-engine",
+            "options": {
+                "symlink": true
+            }
+        }
+    ]
 }
