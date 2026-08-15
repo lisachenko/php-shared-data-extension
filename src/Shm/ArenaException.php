@@ -127,7 +127,7 @@ final class ArenaException extends \RuntimeException
     public static function mutexOperationFailed(string $operation, int $index, int $errorCode): self
     {
         return new self(sprintf(
-            '%s on arena mutex %d failed with error %d; the shared lock state is unusable',
+            '%s on the arena mutex at slot/address %d failed with error %d; the shared lock state is unusable',
             $operation,
             $index,
             $errorCode,

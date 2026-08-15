@@ -93,6 +93,14 @@ final class Arena
     public const int MUTEX_SIZE_FLOOR = 40;
 
     /**
+     * Alignment of a DEDICATED mutex allocated in the payload by allocateMutex()
+     *
+     * One cache line, exactly like the bank's stride: two mutexes sharing a line would make
+     * unrelated structures fight over the same cache line on every lock.
+     */
+    public const int MUTEX_ALIGNMENT = 64;
+
+    /**
      * Mutex 0 serializes the bump cursor, mutex 1 the roots directory; the rest are free
      * for consumers (stripe locks over data structures living in the arena)
      */
@@ -152,6 +160,13 @@ final class Arena
      * @var array<int, CData>
      */
     private array $mutexes = [];
+
+    /**
+     * char* at each DEDICATED payload mutex, keyed by its arena address (see allocateMutex())
+     *
+     * @var array<int, CData>
+     */
+    private array $ownedMutexes = [];
 
     private bool $released = false;
 
@@ -489,16 +504,80 @@ final class Arena
     }
 
     /**
+     * @param bool|null $recovered Set to whether the acquired lock came from a died owner
+     *
      * @return bool Whether the lock was taken; false means somebody else holds it
      */
-    public function tryLockStripe(int $index): bool
+    public function tryLockStripe(int $index, ?bool &$recovered = null): bool
     {
-        return Libc::tryLockMutex($this->stripeAt($index), $index);
+        return Libc::tryLockMutex($this->stripeAt($index), $index, $recovered);
     }
 
     public function unlockStripe(int $index): void
     {
         Libc::unlockMutex($this->stripeAt($index), $index);
+    }
+
+    /**
+     * Picks the stripe mutex that guards the structure living at $address
+     *
+     * Striping by address is what lets an unbounded number of small shared structures share
+     * a bank of 62 locks: unrelated structures usually land on different stripes, and two
+     * that collide are merely serialized against each other, never corrupted. The shift
+     * drops the bits every arena block has in common (allocations are at least 16-aligned),
+     * so neighbouring blocks do not all pile onto one stripe.
+     */
+    public function stripeFor(int $address): int
+    {
+        return self::FIRST_STRIPE + (($address >> 4) & PHP_INT_MAX) % $this->stripeCount();
+    }
+
+    /**
+     * Reserves a robust process-shared mutex of its OWN inside the payload
+     *
+     * The bank has 62 consumer stripes, which is the right shape for many small structures
+     * sharing a few locks (see stripeFor()) and the wrong shape for a structure whose lock is
+     * held on every operation - a channel ring, a slot table. Those allocate their mutex here
+     * instead: it costs one cache line of payload, it is initialized ONCE by the process that
+     * creates the structure (before any worker forks, or under the allocator lock afterwards),
+     * and it means two unrelated channels can never serialize against each other.
+     *
+     * The returned address is stored in the owning structure's header, so a process that
+     * attaches later finds the lock through the arena rather than through inherited state.
+     *
+     * @return int Address of the initialized mutex, valid in every process of the family
+     */
+    public function allocateMutex(): int
+    {
+        $address = $this->allocate(self::MUTEX_SLOT_SIZE, self::MUTEX_ALIGNMENT);
+        Libc::initSharedMutex($this->mutexPointerAt($address));
+
+        return $address;
+    }
+
+    /**
+     * Takes a dedicated mutex; see lockStripe() for the locking rules that apply while held
+     *
+     * @return bool Whether the previous owner died holding this lock (EOWNERDEAD, recovered)
+     */
+    public function lockMutexAt(int $address): bool
+    {
+        return Libc::lockMutex($this->mutexPointerAt($address), $address);
+    }
+
+    /**
+     * @param bool|null $recovered Set to whether the acquired lock came from a died owner
+     *
+     * @return bool Whether the lock was taken; false means somebody else holds it right now
+     */
+    public function tryLockMutexAt(int $address, ?bool &$recovered = null): bool
+    {
+        return Libc::tryLockMutex($this->mutexPointerAt($address), $address, $recovered);
+    }
+
+    public function unlockMutexAt(int $address): void
+    {
+        Libc::unlockMutex($this->mutexPointerAt($address), $address);
     }
 
     /**
@@ -606,8 +685,9 @@ final class Arena
         if ($this->released || !$this->isCreator()) {
             return;
         }
-        $this->released = true;
-        $this->mutexes  = [];
+        $this->released     = true;
+        $this->mutexes      = [];
+        $this->ownedMutexes = [];
 
         Libc::unmap($this->base, $this->size);
     }
@@ -640,6 +720,26 @@ final class Arena
     private function mutexAt(int $index): CData
     {
         return $this->mutexes[$index] ??= $this->pointerAt(self::MUTEX_OFFSET + $index * self::MUTEX_SLOT_SIZE);
+    }
+
+    /**
+     * char* of a dedicated payload mutex, materialized once per process and cached
+     *
+     * The cache matters as much as the bounds check: a CData built per lock would allocate
+     * inside (or immediately before) a critical section, which is exactly what the locking
+     * rules forbid.
+     */
+    private function mutexPointerAt(int $address): CData
+    {
+        if (isset($this->ownedMutexes[$address])) {
+            return $this->ownedMutexes[$address];
+        }
+        $this->assertRange($address, self::MUTEX_SLOT_SIZE);
+        if ($address % self::MUTEX_ALIGNMENT !== 0) {
+            throw ArenaException::misalignedAddress($address);
+        }
+
+        return $this->ownedMutexes[$address] = $this->pointerAt($address - $this->baseAddress);
     }
 
     private function stripeAt(int $index): CData

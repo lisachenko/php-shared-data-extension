@@ -260,20 +260,26 @@ final class Libc
     }
 
     /**
+     * @param bool|null $recovered Set to whether the acquired lock came from a died owner;
+     *                             the trylock path answers the EOWNERDEAD question through
+     *                             this out parameter, so no lock result is ever discarded
+     *
      * @return bool Whether the lock was taken (false = held by somebody else right now)
      */
-    public static function tryLockMutex(CData $mutex, int $index): bool
+    public static function tryLockMutex(CData $mutex, int $index, ?bool &$recovered = null): bool
     {
-        $ffi  = self::ffi();
-        $code = $ffi->pthread_mutex_trylock($mutex);
+        $recovered = false;
+        $ffi       = self::ffi();
+        $code      = $ffi->pthread_mutex_trylock($mutex);
         if ($code === self::EBUSY) {
             return false;
         }
         if ($code === self::EOWNERDEAD) {
-            $recovered = $ffi->pthread_mutex_consistent($mutex);
-            if ($recovered !== 0) {
-                throw ArenaException::mutexOperationFailed('pthread_mutex_consistent', $index, $recovered);
+            $consistent = $ffi->pthread_mutex_consistent($mutex);
+            if ($consistent !== 0) {
+                throw ArenaException::mutexOperationFailed('pthread_mutex_consistent', $index, $consistent);
             }
+            $recovered = true;
 
             return true;
         }
