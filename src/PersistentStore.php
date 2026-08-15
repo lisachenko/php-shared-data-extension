@@ -14,6 +14,10 @@ declare(strict_types=1);
 namespace Lisachenko\SharedData;
 
 use FFI\CData;
+use Lisachenko\SharedData\Shm\Arena;
+use Lisachenko\SharedData\Shm\ArenaAllocator;
+use Lisachenko\SharedData\Shm\ArenaException;
+use Lisachenko\SharedData\Shm\ArenaRegistryLayout;
 use ZEngine\Core;
 use ZEngine\Reflection\ReflectionValue;
 use ZEngine\Type\ObjectEntry;
@@ -49,6 +53,13 @@ use ZEngine\Type\PersistentObjectFactory;
 final class PersistentStore
 {
     /**
+     * Module the arena-backed mode anchors itself in, kept apart from the default one so
+     * globals[0] always means the same thing within a module (a registry address there, an
+     * arena base here)
+     */
+    public const string SHARED_MODULE = 'shared_arena';
+
+    /**
      * Stores booted during this request, keyed by module name (request-scoped: PHP
      * statics reset per request, exactly like the shutdown functions the stores arm)
      *
@@ -77,10 +88,10 @@ final class PersistentStore
 
     private bool $shutdownArmed = false;
 
-    private function __construct(Registry $registry)
+    private function __construct(Registry $registry, ?ArenaAllocator $allocator = null)
     {
         $this->registry  = $registry;
-        $this->persister = new Persister();
+        $this->persister = new Persister($allocator);
     }
 
     /**
@@ -117,6 +128,100 @@ final class PersistentStore
         }
 
         $store = new self($registry);
+
+        self::$activeStores[$moduleName] = $store;
+
+        return $store;
+    }
+
+    /**
+     * Boots a store whose persisted state lives in a FORK-SHARED ARENA
+     *
+     * The opt-in counterpart of boot(): same API, same frozen semantics, but every block
+     * the store mints - registry tables, object clones, snapshots, strings, sealed arrays -
+     * comes out of $arena, so a graph persisted here is readable by every process of the
+     * worker family at the same addresses. Nothing about the default path changes; the two
+     * modes even use different module names, so a worker may run both side by side.
+     *
+     * Call order matters:
+     *
+     *  1. the parent maps the arena and boots this store BEFORE forking - the mapping, the
+     *     registry tables and their roots-directory entries must exist at fork time;
+     *  2. every child boots the same store again to get its own request-scoped view. A
+     *     child takes the RECOVERY path (module globals are inherited and non-zero) and
+     *     therefore never writes the module globals: that page is copy-on-write, so a write
+     *     would silently become private to the child and desynchronize the family.
+     *
+     * ## What v1 of arena mode does NOT do yet (the E1/E2 boundary)
+     *
+     * Sharing the memory is one thing; sharing the ENGINE STATE that lives inside a
+     * zend_object is another, and three of its fields are per-process by nature:
+     *
+     *  - **classes must be loaded before the fork.** A shared clone carries one `ce` slot
+     *    for the whole family, and attach() rebinds it by name. That is only harmless while
+     *    the class entry sits at the same address everywhere, which holds for classes loaded
+     *    before the fork (opcache.preload, or simply touching them) and does not hold for a
+     *    class first autoloaded inside one worker;
+     *  - **`spl_object_id()` is not meaningful on a shared object.** The engine reads the
+     *    handle out of the shared struct, and every process that attaches writes its own
+     *    there - forked children even receive identical handle numbers, since they inherit
+     *    one object-store free list. This store therefore keys everything by ARENA ADDRESS
+     *    and keeps its handles in its own per-process table;
+     *  - **avoid `get_object_vars()`, `var_dump()`, `json_encode()` and `(array)` casts on
+     *    shared objects.** Engine C code caches the rebuilt property bag in the object's
+     *    `properties` field - a request-heap pointer written into shared memory. detach()
+     *    clears it again for this process, but a sibling reading it in the meantime is
+     *    looking at foreign memory.
+     *
+     * All three are what E2's per-process side table exists to fix; until then arena mode is
+     * for state a worker family reads by property access, and frozen semantics still apply -
+     * mutations are rolled back at request end, exactly as in the default mode.
+     *
+     * @param Arena                   $arena      Fork-shared arena, created before any fork
+     * @param ArenaRegistryLayout|null $layout    Table capacities; only read when the
+     *                                            registry is created (the first boot)
+     * @param string                  $moduleName Persistent module to anchor the arena in
+     */
+    public static function bootShared(
+        Arena $arena,
+        ?ArenaRegistryLayout $layout = null,
+        string $moduleName = self::SHARED_MODULE,
+    ): self {
+        $module = new ObjectPersistenceModule($moduleName);
+        if (!$module->isModuleRegistered()) {
+            $module->register();
+            $module->startup();
+        }
+
+        $globals = $module->getGlobals();
+        if ($globals === null) {
+            throw new \RuntimeException('Persistent module globals are not available');
+        }
+        $allocator = new ArenaAllocator($arena);
+
+        if ($globals[0] === 0) {
+            [$registry, $base] = Registry::createInArena($allocator, $layout);
+            // The ONLY globals write of arena mode, and it happens in the process that
+            // owns the arena, before any worker exists
+            $globals[0] = $base;
+            $globals[1] = Registry::LAYOUT_VERSION;
+        } else {
+            if ($globals[1] !== Registry::LAYOUT_VERSION) {
+                throw new \RuntimeException(sprintf(
+                    'Persistent registry of module %s uses layout version %d, this build expects %d; ' .
+                    'restart the worker to rebuild the persisted state',
+                    $moduleName,
+                    $globals[1],
+                    Registry::LAYOUT_VERSION,
+                ));
+            }
+            if ($globals[0] !== $arena->baseAddress()) {
+                throw ArenaException::foreignArena($globals[0], $arena->baseAddress());
+            }
+            $registry = Registry::fromArena($allocator);
+        }
+
+        $store = new self($registry, $allocator);
 
         self::$activeStores[$moduleName] = $store;
 
@@ -286,6 +391,56 @@ final class PersistentStore
     }
 
     /**
+     * Address of an entry's canonical root clone - the eight bytes that travel between workers
+     *
+     * In arena mode this is an address inside the shared mapping, and it means the very same
+     * object in every process of the worker family. Handing it to a sibling over a socket
+     * (as a fixed-size record, never a serialized value) and calling attachObject() there is
+     * the whole cross-process exchange protocol: no encoding, no copy, one pointer.
+     *
+     * Handles are NOT a substitute: forked children inherit the same object-store free list
+     * and hand out identical handle numbers, so handles collide by construction. The address
+     * is the only stable identity across processes.
+     *
+     * @param class-string $className
+     */
+    public function addressOf(string $className): ?int
+    {
+        $entry = $this->registry->findEntry($className);
+
+        return $entry?->root();
+    }
+
+    /**
+     * Materializes the persistent object living at $address for the current request
+     *
+     * The receiving half of the exchange above: the object is looked up in the registry
+     * (which is what proves the address is one of ours), rebound to this process's class
+     * entry and registered in this request's object store if it is not already.
+     *
+     * @param int $address Address obtained from addressOf() in this or another process
+     */
+    public function attachObject(int $address): object
+    {
+        $this->attach();
+
+        $object = $this->registry->findObject($address);
+        if ($object === null) {
+            throw new \RuntimeException(sprintf(
+                'No persistent object is registered at address 0x%x; only addresses handed out by ' .
+                'addressOf() of a store sharing this registry can be attached',
+                $address,
+            ));
+        }
+        if (!isset($this->handles[$address])) {
+            $this->rebindClassEntry($object);
+            $this->register($address, $object->object);
+        }
+
+        return self::instanceOf($object->object);
+    }
+
+    /**
      * @param class-string $className
      */
     public function has(string $className): bool
@@ -322,8 +477,19 @@ final class PersistentStore
         // Drop our own references first so only foreign references remain in the count
         $this->instances = [];
 
-        /** @var list<PersistedObject> $objects */
-        $objects = iterator_to_array($this->registry->allObjects(), false);
+        // Exactly the objects THIS process registered this request, never the whole
+        // registry. In frozen mode the two are the same set (attach() registers every
+        // object there is, and a dropped object leaves both). In arena mode they are not:
+        // a sibling worker may have persisted objects after this process attached, and
+        // those carry a class entry this process never rebound - rolling them back would
+        // dereference another process's zend_class_entry pointer.
+        $objects = [];
+        foreach (array_keys($this->handles) as $address) {
+            $object = $this->registry->findObject($address);
+            if ($object !== null) {
+                $objects[] = $object;
+            }
+        }
 
         foreach ($objects as $object) {
             $this->restoreSnapshot($object->object, $object->snapshot);

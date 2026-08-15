@@ -14,6 +14,7 @@ declare(strict_types=1);
 namespace Lisachenko\SharedData;
 
 use FFI\CData;
+use Lisachenko\SharedData\Shm\ArenaAllocator;
 use ZEngine\Core;
 use ZEngine\Reflection\ReflectionValue;
 use ZEngine\Type\PersistentHashTable;
@@ -56,9 +57,29 @@ use ZEngine\Type\StringEntry;
  * After conversion a byte snapshot of every NEWLY created properties_table is taken:
  * detach() restores them at request shutdown, which gives persisted graphs frozen
  * semantics (request-time mutations do not survive - see README).
+ *
+ * ## Where the converted graph lives
+ *
+ * Given an ArenaAllocator, every block this converter mints - object clones, snapshot
+ * buffers, interned strings, sealed array tables and their keys - comes out of the
+ * fork-shared arena instead of the process heap, and the resulting graph is readable by
+ * every process of the worker family at the same addresses. Without one (the default),
+ * the conversion is byte for byte the malloc-backed one it has always been.
+ *
+ * There is no half-way: a single malloc-backed block inside an otherwise shared graph is
+ * a pointer a sibling process cannot follow, which is why the allocator is threaded
+ * through EVERY minting call below rather than through some of them.
  */
 final class Persister
 {
+    /**
+     * @param ArenaAllocator|null $allocator Source of every persistent block minted here;
+     *                                       null keeps the malloc-backed frozen-mode path
+     */
+    public function __construct(private readonly ?ArenaAllocator $allocator = null)
+    {
+    }
+
     /**
      * Cycle/diamond map of the graph walk: source zend_object address => persistent clone
      *
@@ -123,7 +144,7 @@ final class Persister
                 $created[] = new PersistedObject(
                     $address,
                     $clone['object'],
-                    self::snapshotProperties($clone['object']),
+                    $this->snapshotProperties($clone['object']),
                     $clone['className'],
                     $clone['signature'],
                     $this->arraysByOwner[$address] ?? [],
@@ -178,7 +199,7 @@ final class Persister
 
         $this->assertPersistableObject($rawObject, $instance, $path);
 
-        $clone        = PersistentObjectFactory::persistentClone($rawObject);
+        $clone        = PersistentObjectFactory::persistentClone($rawObject, $this->allocator);
         $cloneAddress = Core::addressOf($clone);
 
         // Registered BEFORE any slot is converted - a self-reference discovered below
@@ -265,19 +286,32 @@ final class Persister
     /**
      * Captures the frozen byte image of an object's finished properties_table
      */
-    private static function snapshotProperties(CData $object): CData
+    private function snapshotProperties(CData $object): CData
     {
-        $tableSize = $object->ce->default_properties_count * Core::sizeof(Core::type('zval'));
-        if ($tableSize > 0) {
-            $snapshot  = Core::trackedNew("char[{$tableSize}]", true);
+        // Even a property-less object needs a non-null anchor buffer
+        $tableSize = max($object->ce->default_properties_count * Core::sizeof(Core::type('zval')), 1);
+        $snapshot  = $this->allocateBuffer($tableSize);
+
+        if ($object->ce->default_properties_count > 0) {
             $tableBase = Core::cast('char *', Core::addr($object->properties_table[0]));
             Core::memcpy($snapshot, $tableBase, $tableSize);
-        } else {
-            // Even a property-less object needs a non-null anchor buffer
-            $snapshot = Core::trackedNew('char[1]', true);
         }
 
-        return Core::cast('char *', $snapshot);
+        return $snapshot;
+    }
+
+    /**
+     * Allocates a raw persistent byte buffer, from the arena when there is one
+     *
+     * @return CData char* to $size zeroed bytes
+     */
+    private function allocateBuffer(int $size): CData
+    {
+        if ($this->allocator === null) {
+            return Core::cast('char *', Core::trackedNew("char[{$size}]", true));
+        }
+
+        return Core::pointerAtAddress('char *', $this->allocator->allocate($size));
     }
 
     /**
@@ -398,7 +432,7 @@ final class Persister
         $string = StringEntry::fromCData($slot->value->str);
 
         if (!$string->isPermanent()) {
-            $interned         = StringEntry::persistentInterned($string->getStringValue());
+            $interned         = StringEntry::persistentInterned($string->getStringValue(), $this->allocator);
             $slot->value->str = $interned->getRawValue();
         }
         // Interned/permanent payloads live in non-refcounted slots (bare IS_STRING)
@@ -410,7 +444,9 @@ final class Persister
      */
     private function persistArray(CData $sourceArray, string $path): PersistentHashTable
     {
-        $target = new PersistentHashTable();
+        // An arena table is pre-sized for the elements it will receive and can never be
+        // grown afterwards; the source array knows exactly how many that is
+        $target = $this->allocator?->createTable($sourceArray->nNumOfElements) ?? new PersistentHashTable();
 
         // Ownership is recorded up front: elements converted below may mint nested tables,
         // and they all belong to the same object - the one whose slot started this array
@@ -442,10 +478,14 @@ final class Persister
             $this->persistValueInPlace(Core::addr($element), "{$path}[{$keyLabel}]");
 
             $elementValue = ReflectionValue::fromValueEntry(Core::addr($element));
-            if ($stringKey !== null) {
+            if ($stringKey === null) {
+                $target->addIndex($intKey, $elementValue);
+            } elseif ($this->allocator === null) {
                 $target->add($stringKey, $elementValue);
             } else {
-                $target->addIndex($intKey, $elementValue);
+                // Keys are part of the shared payload: minted in the arena as well, or a
+                // sibling process would follow the bucket key into foreign memory
+                $target->addInterned(StringEntry::persistentInterned($stringKey, $this->allocator), $elementValue);
             }
         }
         Core::free($element);

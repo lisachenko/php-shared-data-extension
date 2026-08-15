@@ -143,6 +143,51 @@ final class ArenaException extends \RuntimeException
         ));
     }
 
+    public static function invalidRegistryCapacity(int $entryCapacity, int $objectCapacity): self
+    {
+        return new self(sprintf(
+            'Arena registry capacities must be whole numbers of at least %d, got %d entries and %d objects',
+            ArenaRegistryLayout::MINIMUM_TABLE_CAPACITY,
+            $entryCapacity,
+            $objectCapacity,
+        ));
+    }
+
+    public static function registryTableFull(string $table, int $capacity): self
+    {
+        return new self(sprintf(
+            'The arena registry table "%s" is full: all %d bucket slots are used, and growing it ' .
+            'would make the engine reallocate arena memory into this worker\'s private heap. ' .
+            'Size the registry with %s / %s before the workers fork.',
+            $table,
+            $capacity,
+            ArenaRegistryLayout::ENTRY_CAPACITY_ENV,
+            ArenaRegistryLayout::OBJECT_CAPACITY_ENV,
+        ));
+    }
+
+    public static function registryTableRelocated(string $table, int $dataAddress): self
+    {
+        return new self(sprintf(
+            'The bucket storage of the arena registry table "%s" now lives at 0x%x, outside the ' .
+            'arena: the engine has grown the table into a private heap, and every process but the ' .
+            'one that grew it is looking at memory that is not shared (and may already be freed). ' .
+            'The registry is unusable - restart the worker pool with a larger capacity.',
+            $table,
+            $dataAddress,
+        ));
+    }
+
+    public static function foreignArena(int $expected, int $found): self
+    {
+        return new self(sprintf(
+            'The persistent module is anchored to the arena at 0x%x, but 0x%x was passed; a worker ' .
+            'can only attach the arena its module globals were written for',
+            $expected,
+            $found,
+        ));
+    }
+
     public static function released(): self
     {
         return new self('This arena has already been unmapped by its creating process');

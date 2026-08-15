@@ -23,10 +23,26 @@ use ZEngine\EngineExtension\ModuleLifecycleInterface;
  *
  * The module globals hold two machine words that survive the request boundary in the
  * worker process:
- *   [0] pointer to the persistent registry HashTable (0 until first boot)
- *   [1] layout version of the registry format (Registry::LAYOUT_VERSION, currently 3),
+ *   [0] anchor of the persisted state (0 until first boot): the persistent registry
+ *       HashTable in the default mode, the ARENA BASE in arena mode
+ *       (PersistentStore::bootShared - the registry tables are then found through the
+ *       arena's own roots directory, which is all a forked child can rely on)
+ *   [1] layout version of the registry format (Registry::LAYOUT_VERSION, currently 4),
  *       written when the registry is created and verified on every later boot - a worker
  *       holding a registry from an older build is rejected instead of misread
+ *
+ * Which of the two meanings applies is a property of the MODULE, never something to guess
+ * from the value: the two modes use different module names, so within one module globals[0]
+ * always means the same thing.
+ *
+ * ## Globals are read-only in forked children
+ *
+ * The globals of a persistent module live in ordinary process memory, so a fork gives every
+ * child a copy-on-write copy of that page. A child writing there does not corrupt anything -
+ * it does something worse, silently: the write becomes private to that child, and from then
+ * on parent and child disagree about where the persisted state is. Only the process that
+ * CREATES the state writes these words, before any worker exists; every later boot (later
+ * request, or any child) takes the recovery path and only reads them.
  *
  * This is the same cross-request anchor mechanism as the counter demo in demo.php,
  * reduced to a single pointer slot: everything else persistent hangs off the registry.

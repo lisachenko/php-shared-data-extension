@@ -301,7 +301,7 @@ final class Arena
     {
         $this->assertLive();
 
-        return $this->words[self::WORD_MUTEX_SIZE];
+        return (int) $this->words[self::WORD_MUTEX_SIZE];
     }
 
     /**
@@ -340,7 +340,7 @@ final class Arena
 
         Libc::lockMutex($mutex, self::ALLOCATOR_MUTEX);
 
-        $cursor  = $this->words[self::WORD_CURSOR];
+        $cursor  = (int) $this->words[self::WORD_CURSOR];
         $aligned = ($cursor + $align - 1) & ~($align - 1);
         $next    = $aligned + $size;
         $fits    = $next <= $this->size;
@@ -416,7 +416,7 @@ final class Arena
         if ($slot !== null) {
             $entry = $this->rootWordIndex($slot);
             if ($this->words[$entry + self::ROOT_WORD_HASH] !== 0) {
-                $address = $this->words[$entry + self::ROOT_WORD_ADDRESS];
+                $address = (int) $this->words[$entry + self::ROOT_WORD_ADDRESS];
             }
         }
 
@@ -455,11 +455,11 @@ final class Arena
             }
             $nameWords = [];
             for ($word = 0; $word < self::ROOT_NAME_SIZE / 8; $word++) {
-                $nameWords[] = $this->words[$entry + self::ROOT_WORD_NAME + $word];
+                $nameWords[] = (int) $this->words[$entry + self::ROOT_WORD_NAME + $word];
             }
             $raw[] = [
-                $this->words[$entry + self::ROOT_WORD_ADDRESS],
-                $this->words[$entry + self::ROOT_WORD_LENGTH],
+                (int) $this->words[$entry + self::ROOT_WORD_ADDRESS],
+                (int) $this->words[$entry + self::ROOT_WORD_LENGTH],
                 $nameWords,
             ];
         }
@@ -502,6 +502,25 @@ final class Arena
     }
 
     /**
+     * Whether a whole address range lies inside this arena's payload
+     *
+     * The bounds check behind every "is this structure still shared?" question: an engine
+     * data block that has been reallocated into a worker's private heap answers false, and
+     * that pointer change is the ONLY observable symptom of the resize - the engine writes
+     * the new address into the shared struct before it aborts, so surviving siblings would
+     * otherwise read plausible garbage with no signal at all.
+     */
+    public function contains(int $address, int $length = 1): bool
+    {
+        if ($this->released || $length < 0) {
+            return false;
+        }
+        $offset = $address - $this->baseAddress;
+
+        return $offset >= self::HEADER_SIZE && $offset + $length <= $this->size;
+    }
+
+    /**
      * Reads one aligned 64-bit word of arena payload
      */
     public function readWord(int $address): int
@@ -511,7 +530,7 @@ final class Arena
             throw ArenaException::misalignedAddress($address);
         }
 
-        return $this->words[($address - $this->baseAddress) >> 3];
+        return (int) $this->words[($address - $this->baseAddress) >> 3];
     }
 
     /**
@@ -581,7 +600,7 @@ final class Arena
 
     private function cursor(): int
     {
-        return $this->words[self::WORD_CURSOR];
+        return (int) $this->words[self::WORD_CURSOR];
     }
 
     /**
