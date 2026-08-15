@@ -125,13 +125,13 @@ final class ValueCodec
     {
         return match ($tag) {
             ValueTag::Nil, ValueTag::Close => null,
-            ValueTag::True  => true,
-            ValueTag::False => false,
-            ValueTag::Int   => $payload,
-            ValueTag::Float => self::bitsToFloat($payload),
-            ValueTag::Str   => $this->readString($payload),
-            ValueTag::Obj   => $this->attachObject($payload),
-            ValueTag::Arr   => SharedArray::attach($this->allocator, $this, $payload),
+            ValueTag::True    => true,
+            ValueTag::False   => false,
+            ValueTag::Int     => $payload,
+            ValueTag::Float   => self::bitsToFloat($payload),
+            ValueTag::Str     => $this->readString($payload),
+            ValueTag::Obj     => $this->attachObject($payload),
+            ValueTag::Arr     => SharedArray::attach($this->allocator, $this, $payload),
             ValueTag::Closure => $this->resolveClosure($payload),
         };
     }
