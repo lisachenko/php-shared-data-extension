@@ -502,6 +502,29 @@ final class Arena
     }
 
     /**
+     * Verifies that the mapping still is the arena this build knows how to read
+     *
+     * Cheap, and the natural first thing a recovering worker does: the magic proves the
+     * region is an arena at all (rather than a stale address or a mapping that was replaced),
+     * and the layout version proves the offsets of the mutex bank and the roots directory
+     * are the ones this build compiles against. A mismatch is a hard failure - reading a
+     * foreign layout would mean locking bytes that are somebody else's data.
+     */
+    public function assertIntact(): void
+    {
+        $this->assertLive();
+
+        $magic = (int) $this->words[self::WORD_MAGIC];
+        if ($magic !== self::MAGIC) {
+            throw ArenaException::notAnArena($magic);
+        }
+        $version = (int) $this->words[self::WORD_LAYOUT_VERSION];
+        if ($version !== self::LAYOUT_VERSION) {
+            throw ArenaException::layoutMismatch($version, self::LAYOUT_VERSION);
+        }
+    }
+
+    /**
      * Whether a whole address range lies inside this arena's payload
      *
      * The bounds check behind every "is this structure still shared?" question: an engine

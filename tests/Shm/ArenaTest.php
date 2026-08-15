@@ -44,6 +44,17 @@ class ArenaTest extends TestCase
         $this->assertSame(getmypid(), $arena->creatorPid());
     }
 
+    public function testAFreshArenaPassesItsOwnHeaderCheck(): void
+    {
+        $arena = $this->makeArena();
+
+        // Magic plus layout version: what a recovering worker verifies before it trusts a
+        // single offset inside the inherited mapping
+        $arena->assertIntact();
+
+        $this->assertSame(Arena::LAYOUT_VERSION, 1);
+    }
+
     public function testMutexSlotHoldsThisPlatformsMutex(): void
     {
         $arena = $this->makeArena();

@@ -218,6 +218,10 @@ final class PersistentStore
             if ($globals[0] !== $arena->baseAddress()) {
                 throw ArenaException::foreignArena($globals[0], $arena->baseAddress());
             }
+            // The mapping is inherited, not re-created: prove it is still an arena of this
+            // layout before any offset inside it is trusted
+            $arena->assertIntact();
+
             $registry = Registry::fromArena($allocator);
         }
 
