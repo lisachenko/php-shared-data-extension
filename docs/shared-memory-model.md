@@ -179,7 +179,86 @@ objects (data), not as callables.
 
 [#20]: https://github.com/lisachenko/php-shared-data-extension/issues/20
 
-## 8. Structural notes worth knowing
+## 8. How the solution is implemented, primitive by primitive
+
+The laws above decide the shape of everything below; this section is the map from law to
+code, so a reader can go from "why is it like this" to the file that does it.
+
+### The arena (`Shm\Arena`, `Shm\ArenaAllocator`, `Shm\Libc`)
+
+One `MAP_SHARED|MAP_ANONYMOUS` mapping created before the fork, laid out as: header words
+(magic, layout version, size, bump cursor, creator pid, measured mutex size, roots capacity) ·
+a bank of 64 robust process-shared mutexes on 64-byte cache lines (slot 0 = allocator,
+slot 1 = roots directory, 2… = consumer stripes) · a roots directory of 64 named addresses ·
+the bump-allocated payload.
+
+- `allocate()` moves the shared cursor under the allocator mutex — that is the entire
+  allocator, per §6, and it is why an allocation from a child is safe while a free is not;
+- `sizeof(pthread_mutex_t)` is *measured* at runtime rather than assumed, and checked against
+  the 64-byte slot stride;
+- `stripeFor($address)` hashes an address onto one of the 62 consumer stripes, which is how an
+  unbounded number of small structures share a bounded bank of locks;
+- **no public method returns `FFI\CData`**: views are bound once per process at map time, and
+  callers see integers and strings. That is not tidiness — it is what keeps every critical
+  section to aligned word access (§2);
+- `ArenaAllocator` implements z-engine's `Allocator` seam, so the *persister* mints object
+  clones, snapshots, strings, sealed arrays **and their bucket keys** out of the arena. There
+  is no half-way: one malloc-backed block inside a shared graph is a pointer a sibling cannot
+  follow.
+
+### The registry (`Registry`, `Shm\ArenaRegistryLayout`)
+
+Named graphs and a process-wide object table, both living in the arena and published in the
+roots directory — a forked child finds them with nothing but the mapping. Tables are pre-sized
+and never grown (§4): an insert that would resize is refused with the table named, and
+recovery re-derives `HT_GET_DATA_ADDR` and bounds-checks it against the arena. Object records
+carry the object's **role** (frozen or shared-mutable), so every worker reads the same
+lifecycle rules for the same address.
+
+### The per-process side table (`SideTable`, `PersistentStore`)
+
+The remedy for §3, keyed by arena address: `handle` (from z-engine's
+`ObjectEntry::register()`, after which the shared field is overwritten with a sentinel), `ce`
+(rebound per process at attach), `properties` (forced `NULL` at attach and scrubbed after any
+triggering operation, never dereferenced). Identity is exposed as
+`PersistentStore::sharedIdOf()` — the arena address — and never as a handle.
+
+### Mutation (`SharedObjectHandle`)
+
+The synchronized write path for a graph persisted with `mutable: true`. Every write validates
+and encodes its payload *before* taking the object's stripe lock; the critical section is
+payload word then type word and nothing else (§2). Strings are interned into the arena and
+swapped as one aligned 8-byte pointer, the previous block leaking by design (§6); object
+references may only point at another object of the same arena; array slots stay sealed.
+Direct `$obj->prop = …` writes remain legal, work for scalars and are **unsynchronized** —
+the engine gives no write hook to a class rewired to `std_object_handlers`, which is a
+deliberate trade, not an oversight. A slot found holding a foreign (non-arena) pointer at
+request end is repaired from the frozen image rather than left for a sibling to dereference.
+
+### Value records and the IPC primitives (`Ipc\*`)
+
+Everything crossing a worker boundary is a **16-byte tagged record** — `uint8 tag | 7 pad |
+uint64 payload` — where the payload is the value itself for scalars and an *address* for
+strings, objects and shared arrays. A value with no address-shaped form (plain array,
+resource, non-shared object, closure) is refused with the remedy named, never encoded: that
+is the Never-Serialize Rule in one sentence.
+
+- `SharedChannel` — a ring of records plus sender/receiver waiter tables under its **own**
+  dedicated mutex (a structure locked on every operation does not belong on a shared stripe).
+  Head and tail are monotonic counters, so fill level is a subtraction; capacity 0 is a true
+  cross-process rendezvous; `close()` crosses processes;
+- `SharedArray` — fixed-capacity vector of records, per-instance stripe: the container a
+  `zend_array` cannot be (§4);
+- `ResultSlotTable` — futures. A slot settles exactly once, carrying either a value record or
+  a `SharedError` (a persisted three-string object; a `Throwable` can never be shared);
+- `SharedMutex` / `AtomicInt` / `SharedWaitGroup` — robust locking, an aligned word with
+  stripe-locked read-modify-write (FFI has no CAS), and a counter with waiters;
+- `WakeRegistry` — one inherited socket pair per process. Sockets carry a fixed 16-byte event
+  record (`opcode | tag | id | address`) and never a payload: **signalling, not
+  serialization**. Waking is level-triggered and re-checked inside the critical section, so a
+  wakeup may be spurious but can never be lost.
+
+## 9. Structural notes worth knowing
 
 - `zval` (16), `Bucket` (32), `zend_array` (56) and `zend_object` (56 + 16·(n−1)) are
   **byte-identical between 8.4 and 8.5** on linux-x64-nts, so the arena layout needs no
@@ -192,7 +271,7 @@ objects (data), not as callables.
   *after* the fork and hand its address to the parent, which attaches it after the child has
   exited.
 
-## 9. Known limitations, and where they are tracked
+## 10. Known limitations, and where they are tracked
 
 | Limitation | Status |
 |---|---|
