@@ -262,7 +262,8 @@ of the next iteration fixes, and all of them are spelled out on `bootShared()`):
 Reader/writer contract for anything you build on the arena directly: a naturally aligned
 8-byte read never tears, but a 16-byte `zval` is two stores — readers take the same stripe
 mutex as the writer whenever a value's *type* can change or more than one slot participates.
-The evidence for every claim in this section is in `spikes/`.
+Every claim in this section, with its evidence and its consequences, is written up in
+[docs/shared-memory-model.md](docs/shared-memory-model.md).
 
 ### IPC primitives in the arena (experimental)
 
