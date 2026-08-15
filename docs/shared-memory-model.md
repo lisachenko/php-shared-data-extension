@@ -144,9 +144,13 @@ failure instead of overlapping neighbours.
 
 The arena is a **bump allocator**: one cursor, moved forward under a lock, never moved back.
 There is no free list, no per-block header, and blocks are reclaimed only when the region
-dies — which happens when the **creating** process exits (a child unmapping the region would
-pull memory out from under its parent and siblings, so `destroy()` in a child is a deliberate
-no-op).
+dies — which happens when the **creating process exits** and the kernel takes the mapping
+back. Nothing unmaps it earlier, and that is a correctness requirement rather than laziness:
+PHP runs shutdown functions *before* it destroys the symbol table and the object store, so any
+variable still holding a shared object is released after an unmap armed there would have
+happened — a segfault waiting for the right test order. A child never unmaps either
+(`destroy()` in a child is a deliberate no-op); its copy of the mapping goes away with the
+process.
 
 What that costs, concretely:
 

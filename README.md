@@ -241,7 +241,9 @@ tables refuse the insert with a typed `ArenaException` instead. Sizes come from
 
 The arena is bump-allocated and **leak-until-teardown**: blocks are never returned
 individually (`drop()` still removes entries and share-accounts them, it just does not free
-arena memory), and only the creating process unmaps the region, at shutdown. `watermark()`
+arena memory), and the region lives until the creating process exits — nothing unmaps it at
+request shutdown, because the engine releases the last references to shared objects *after*
+shutdown functions have run. `watermark()`
 exposes exactly how much has been handed out, and exhaustion is a typed exception, never a
 crash. Cross-process locking uses a bank of 64 `PTHREAD_PROCESS_SHARED | PTHREAD_MUTEX_ROBUST`
 mutexes inside the arena, so a SIGKILLed worker hands the lock on (`EOWNERDEAD`) instead of

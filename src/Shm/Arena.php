@@ -51,8 +51,10 @@ use FFI\CData;
  *
  * `allocate()` moves one cursor forward under the allocator mutex and never moves it back.
  * There is no free list and no per-block header: blocks are released when the arena dies,
- * which is when the CREATING process exits (only it unmaps - a child unmapping the region
- * would pull memory out from under its parent and its siblings). This is deliberate for v1:
+ * which is when the CREATING process EXITS - the kernel reclaims the mapping, and nothing
+ * unmaps it earlier (see destroy(): request shutdown releases the last references to shared
+ * objects after its shutdown functions have run, so an unmap armed there is a segfault
+ * waiting for the right order). This is deliberate for v1:
  * a shared free list needs cross-process reachability accounting that nothing here can
  * provide yet. Exhaustion is therefore a normal, typed outcome - ArenaException::exhausted().
  *
@@ -213,12 +215,8 @@ final class Arena
             Libc::initSharedMutex($arena->mutexAt($index));
         }
 
-        // Only the creator ever unmaps - children inherit this shutdown function through
-        // fork() and it has to stay a no-op there
-        register_shutdown_function(static function () use ($arena): void {
-            $arena->destroy();
-        });
-
+        // Deliberately NO shutdown function that unmaps: see destroy() for why unmapping at
+        // request shutdown is unsafe by ordering, and why the process exit is the right moment
         return $arena;
     }
 
@@ -675,10 +673,26 @@ final class Arena
     /**
      * Unmaps the arena - the creating process only, and only once
      *
-     * A child calling this is a deliberate no-op rather than an error: the shutdown
-     * function armed at create() is inherited by every fork, and a child unmapping the
-     * region would tear the arena out from under its parent and siblings. A child's own
-     * copy of the mapping goes away with the process anyway.
+     * A child calling this is a deliberate no-op rather than an error: a child unmapping the
+     * region would tear the arena out from under its parent and siblings, and its own copy of
+     * the mapping goes away with the process anyway.
+     *
+     * ## Why this is NOT armed as a shutdown function
+     *
+     * It used to be, and it was a SIGSEGV waiting for the right test order. Request shutdown
+     * runs registered functions first and destroys the symbol table, the object store and
+     * every remaining zval AFTERWARDS - so any variable still holding a shared object (a
+     * global, a static, a store that has not detached yet) is released against memory that is
+     * no longer mapped. The mapping is necessarily created before any of them, and shutdown
+     * functions run in registration order, so no amount of ordering inside this class can put
+     * the unmap last.
+     *
+     * The arena is process-scoped by design (created once, before the workers fork), and a
+     * mapping is reclaimed by the kernel when the process exits - which is exactly the
+     * lifetime the leak-until-teardown model already assumes. So the automatic unmap is gone
+     * and this method stays available for a caller who genuinely owns the moment: nothing may
+     * reference the arena anymore when it is called - no attached store, no shared instance,
+     * no IPC structure.
      */
     public function destroy(): void
     {
