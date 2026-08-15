@@ -202,6 +202,163 @@ graph in `tools/soak-drop.php`, against ~13 kB per cycle if nothing were
 reclaimed. A real content-keyed persistent intern table would remove this
 residue; it is the next iteration.
 
+### Fork-shared arena mode (opt-in, experimental)
+
+Everything above is **per-worker** memory: each FPM/RoadRunner process rebuilds its own
+copy. Arena mode removes that limit for a family of processes that descend from one
+parent. The state is persisted into a single `mmap(MAP_SHARED|MAP_ANONYMOUS)` region
+created **before the fork**, so every worker sees the very same objects at the very same
+addresses — no serialization, no cache round-trip, no copy.
+
+```php
+use Lisachenko\SharedData\PersistentStore;
+use Lisachenko\SharedData\Shm\Arena;
+
+$arena = Arena::create();                    // 64 MB by default, or SHARED_DATA_ARENA_SIZE
+$store = PersistentStore::bootShared($arena);
+
+$config = $store->persist(AppConfig::class, buildExpensiveConfig());
+$address = $store->addressOf(AppConfig::class);   // eight bytes that mean the same thing
+                                                  // in every process of the family
+for ($worker = 0; $worker < 4; $worker++) {
+    if (pcntl_fork() === 0) {
+        $childStore = PersistentStore::bootShared($arena);   // recovery, no globals write
+        $config     = $childStore->get(AppConfig::class);    // the SAME object, not a copy
+        // ... or attach an address a sibling sent over a socket:
+        // $object = $childStore->attachObject($address);
+        exit(0);
+    }
+}
+```
+
+What changes under the hood: every block the store mints — registry tables, object clones,
+frozen snapshots, interned strings, sealed arrays and their keys — comes out of the arena
+instead of malloc. The registry tables are **pre-sized and never grown**: the engine grows
+a full hashtable by reallocating its data block into the private heap of whichever worker
+filled it, writing that pointer into the shared struct *before* anything fails, so the
+tables refuse the insert with a typed `ArenaException` instead. Sizes come from
+`SHARED_DATA_ENTRY_CAPACITY` / `SHARED_DATA_OBJECT_CAPACITY`.
+
+The arena is bump-allocated and **leak-until-teardown**: blocks are never returned
+individually (`drop()` still removes entries and share-accounts them, it just does not free
+arena memory), and the region lives until the creating process exits — nothing unmaps it at
+request shutdown, because the engine releases the last references to shared objects *after*
+shutdown functions have run. `watermark()`
+exposes exactly how much has been handed out, and exhaustion is a typed exception, never a
+crash. Cross-process locking uses a bank of 64 `PTHREAD_PROCESS_SHARED | PTHREAD_MUTEX_ROBUST`
+mutexes inside the arena, so a SIGKILLed worker hands the lock on (`EOWNERDEAD`) instead of
+wedging the pool.
+
+**Per-process engine state.** Three fields of a `zend_object` describe the process reading
+it, not the object, and they live in a per-process side table rather than in shared memory:
+the object-store `handle` (forked children inherit one free list and are handed *identical*
+numbers, so the shared field is overwritten with a sentinel and identity is
+`$store->sharedIdOf($object)` — the arena address), the class entry (rebound per process;
+classes must still be loaded **before the fork**, since a shared object carries one `ce` for
+the family), and the dynamic-property cache. That last one is written by engine C code on
+`get_object_vars()`, `var_dump()`, `json_encode()`, `(array)`, `serialize()`,
+`debug_zval_dump()` and `ReflectionObject` — a request-heap pointer deposited in shared
+memory — so it is forced `NULL` at attach and never dereferenced. Inspect a shared object
+through `$store->inspect($object, fn ($o) => var_dump($o))`, or call
+`$store->scrubProperties($object)` afterwards.
+
+### Shared mutation (opt-in per graph)
+
+By default a persisted graph is **frozen**: request-time mutations are rolled back at
+request end. Pass `mutable: true` and the graph keeps everything that makes a persistent
+clone safe — the refcount pin, `GC_PERSISTENT|GC_NOT_COLLECTABLE`, non-refcounted payloads,
+sealed arrays — and gives up the rollback, so what a worker writes stays written for the
+whole family:
+
+```php
+$counters = $store->persist(Counters::class, new Counters(), mutable: true);
+$handle   = $store->mutableHandle($counters);
+
+$handle->writeScalars(['hits' => 1, 'misses' => 0]);   // one critical section
+$handle->writeString('lastRoute', '/checkout');        // interned in the arena, pointer swapped
+$handle->writeReference('owner', $otherSharedObject);  // arena objects only
+
+[$hits, $misses] = array_values($handle->readScalars(['hits', 'misses']));
+```
+
+Every write takes the object's stripe mutex and does nothing inside it but store the payload
+word and then the type word; every value is validated and interned *before* the lock.
+Declared property types are enforced by the write path, because the engine never sees the
+assignment. What is refused: a plain-array slot (a shared `zend_array` can never grow — use
+`Ipc\SharedArray`), and a reference to an object that is not itself in this arena.
+
+A direct `$object->hits++` still compiles and still reaches shared memory — the extension
+rewires shared objects to `std_object_handlers`, so there is no write hook to intercept it.
+For scalars that is merely **unsynchronized** (visible everywhere, racy). For a string,
+array or object it stores a pointer into the writing process's request heap, which no
+sibling may follow: such a slot is restored from the persisted image at detach instead of
+being left behind. Use the handle for anything that has to be correct.
+
+Reader/writer contract for anything you build on the arena directly: a naturally aligned
+8-byte read never tears, but a 16-byte `zval` is two stores — readers take the same stripe
+mutex as the writer whenever a value's *type* can change or more than one slot participates.
+Every claim in this section, with its evidence and its consequences, is written up in
+[docs/shared-memory-model.md](docs/shared-memory-model.md).
+
+### IPC primitives in the arena (experimental)
+
+Shared memory answers "where does the value live"; it says nothing about "whose turn is it"
+and "is it there yet". `Lisachenko\SharedData\Ipc` adds the primitives that do, and they are
+themselves structures in the arena — a channel, an array, a mutex, a counter, a wait group
+and a table of result slots, all found by address (or by a name in the arena roots
+directory) rather than inherited as PHP state.
+
+```php
+use Lisachenko\SharedData\Ipc\{SharedChannel, ResultSlotTable, ValueCodec, WakeRegistry};
+use Lisachenko\SharedData\Shm\{Arena, ArenaAllocator};
+
+$arena     = Arena::create();
+$store     = PersistentStore::bootShared($arena);
+$allocator = new ArenaAllocator($arena);
+$codec     = new ValueCodec($allocator, $store);
+$wake      = WakeRegistry::create($arena);              // socket pairs, created PRE-FORK
+$jobs      = SharedChannel::create($allocator, $codec, $wake, 64, name: 'jobs');
+$results   = ResultSlotTable::create($allocator, $codec, $wake, 1024);
+
+$slot = $results->allocateSlot();
+if (pcntl_fork() === 0) {
+    [$job, $ok] = $jobs->recv();                        // parks on the socket, wakes on an event
+    $results->complete($slot, process($job));           // writes a record, pokes the waiter
+    exit(0);
+}
+$jobs->send($sharedObject);                             // an address, never a copy
+$value = $results->await($slot)->value;                 // read straight out of shared memory
+```
+
+Values move as **16-byte records**: `uint8 tag | 7 pad | uint64 payload`, where the payload
+is the value itself (`int`, `float`, nothing at all for `null`/`bool`) or an arena address
+(an interned `zend_string`, a shared `zend_object`, a `SharedArray`). A value with no
+address-shaped form — a plain array, a resource, a closure, an object this family does not
+share — is refused with `NotShareableValueException` naming the remedy. Nothing is ever
+encoded: there is no `serialize()`, igbinary or JSON on any data path, and the test suite
+proves it by shadowing every encoding function in the package's namespaces.
+
+The sockets carry **only** fixed 16-byte event records `{opcode, tag, slot/channel id,
+address}` — signalling, never payload; a scalar's record carries a zero where an address
+would be. Waking is level-triggered: a waiter registers in the structure's waiter table and
+re-checks the state inside the same critical section, so a wakeup can be spurious but never
+lost, and every blocking loop also re-polls on a bounded slice.
+
+| Primitive | What it is |
+|---|---|
+| `SharedChannel` | ring of records + waiter tables under a dedicated robust mutex; capacity 0 is a true cross-process rendezvous; `close()` crosses processes (receivers drain, then `[null, false]`; senders throw) |
+| `SharedArray` | fixed-capacity vector of records, `ArrayAccess`/`Countable`/`IteratorAggregate`, stripe-locked |
+| `ResultSlotTable` | futures: `allocateSlot()` / `complete()` / `completePanic()` / `await()`, with panics travelling as a shared `SharedError` object |
+| `SharedMutex` | robust process-shared mutex with trylock-and-backoff, `EOWNERDEAD` recovered and reported |
+| `AtomicInt` | one shared cell: plain aligned get/set, stripe-locked `add()`/`compareAndSet()` |
+| `SharedWaitGroup` | counter plus waiter table; `add()`/`done()`/`wait()`, negative counts throw |
+| `WakeRegistry` | one inherited socket pair per process, the notification plane everything parks on |
+
+Blocking here is a spin loop over the notification descriptor, which is the honest primitive
+a package with no scheduler can offer: every primitive also exposes its non-blocking half
+(`trySend()`/`tryRecv()`/`tryLock()`/`readSlot()`) plus `notificationStream()`, so a
+coroutine runtime can park a Fiber in its own event loop instead.
+
 ### Deployment model
 
 - **Scope: one worker process.** This is per-process persistent memory, not
@@ -245,13 +402,33 @@ $store->has(User::class): bool;
 $store->drop(User::class): bool;           // remove the entry + reclaim what nobody shares
 $store->objectCount(): int;                // live persistent clones (shared ones counted once)
 $store->detach(): void;                    // runs automatically at request shutdown
+
+// fork-shared arena mode (opt-in)
+$arena = Arena::create();                  // pre-fork, fixed size, leak-until-teardown
+$store = PersistentStore::bootShared($arena);
+$store->addressOf(User::class): ?int;      // the eight bytes that travel between workers
+$store->attachObject($address): object;    // the receiving half, in any process of the family
+$arena->watermark(): int;                  // arena bytes handed out so far
+$arena->contains($address, $length): bool; // is this pointer still shared memory?
+
+// IPC primitives (all of them live in the arena; every one has a non-blocking half)
+$wake    = WakeRegistry::create($arena);              // pre-fork; sockets are inherited
+$channel = SharedChannel::create($allocator, $codec, $wake, $capacity);
+$channel->send($value, $timeout): bool;               // trySend() never blocks
+$channel->recv($timeout): array;                      // [value, true] | [null, false]; tryRecv() too
+$channel->close(): void;                              // crosses processes, drains first
+$channel->notificationStream();                       // park your own event loop on this
+$slots = ResultSlotTable::create($allocator, $codec, $wake, $capacity);
+$slots->allocateSlot(): int;
+$slots->complete($id, $value): void;                  // completePanic($id, SharedError::capture(...))
+$slots->await($id, $timeout): SlotResult;             // readSlot() never blocks
 ```
 
 ## Testing
 
 ```bash
 composer install
-vendor/bin/phpunit                       # unit + lifecycle tests
+vendor/bin/phpunit                       # unit + lifecycle tests (forking arena suites included)
 php -d ffi.enable=1 tools/soak.php       # 5k attach/mutate/detach cycles, flat-memory gate
 php -d ffi.enable=1 tools/soak-drop.php  # 5k persist/attach/drop cycles, reclamation gate
 bash tools/request-boundary/run.sh 100   # real RINIT/RSHUTDOWN boundaries via php-cgi/FastCGI

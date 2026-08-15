@@ -13,6 +13,8 @@ declare(strict_types=1);
 
 namespace Lisachenko\SharedData;
 
+use Lisachenko\SharedData\Shm\Arena;
+use ZEngine\Core;
 use ZEngine\EngineExtension\AbstractModule;
 use ZEngine\EngineExtension\ModuleDependency;
 use ZEngine\EngineExtension\ModuleInfoInterface;
@@ -23,10 +25,26 @@ use ZEngine\EngineExtension\ModuleLifecycleInterface;
  *
  * The module globals hold two machine words that survive the request boundary in the
  * worker process:
- *   [0] pointer to the persistent registry HashTable (0 until first boot)
- *   [1] layout version of the registry format (Registry::LAYOUT_VERSION, currently 3),
+ *   [0] anchor of the persisted state (0 until first boot): the persistent registry
+ *       HashTable in the default mode, the ARENA BASE in arena mode
+ *       (PersistentStore::bootShared - the registry tables are then found through the
+ *       arena's own roots directory, which is all a forked child can rely on)
+ *   [1] layout version of the registry format (Registry::LAYOUT_VERSION, currently 5),
  *       written when the registry is created and verified on every later boot - a worker
  *       holding a registry from an older build is rejected instead of misread
+ *
+ * Which of the two meanings applies is a property of the MODULE, never something to guess
+ * from the value: the two modes use different module names, so within one module globals[0]
+ * always means the same thing.
+ *
+ * ## Globals are read-only in forked children
+ *
+ * The globals of a persistent module live in ordinary process memory, so a fork gives every
+ * child a copy-on-write copy of that page. A child writing there does not corrupt anything -
+ * it does something worse, silently: the write becomes private to that child, and from then
+ * on parent and child disagree about where the persisted state is. Only the process that
+ * CREATES the state writes these words, before any worker exists; every later boot (later
+ * request, or any child) takes the recovery path and only reads them.
  *
  * This is the same cross-request anchor mechanism as the counter demo in demo.php,
  * reduced to a single pointer slot: everything else persistent hangs off the registry.
@@ -90,8 +108,16 @@ final class ObjectPersistenceModule extends AbstractModule implements ModuleInfo
     {
         $names       = [];
         $objectCount = 0;
+        $store       = PersistentStore::activeStore($this->getName());
         $globals     = $this->getGlobals();
-        if ($globals !== null && $globals[0] !== 0) {
+
+        if ($store !== null) {
+            // The live store knows which registry it holds - and in arena mode it is the
+            // ONLY thing that does: globals[0] is the arena base there, so reading it as a
+            // registry pointer would dereference the arena header as a hashtable
+            $names       = $store->entryNames();
+            $objectCount = $store->objectCount();
+        } elseif ($globals !== null && $globals[0] !== 0 && !self::anchorsAnArena($globals[0])) {
             $registry    = Registry::fromAddress($globals[0]);
             $names       = $registry->names();
             $objectCount = $registry->objectCount();
@@ -103,6 +129,18 @@ final class ObjectPersistenceModule extends AbstractModule implements ModuleInfo
             'Persisted object clones'    => $objectCount,
             'Persisted entry names'      => $names === [] ? '(none)' : implode(', ', $names),
         ];
+    }
+
+    /**
+     * Whether the module anchor points at an ARENA rather than at a registry hashtable
+     *
+     * The last line of defence for a reporting path that runs without a live store: an
+     * arena starts with its magic word, a registry with an ordinary hashtable header, so
+     * one aligned load tells the two apart before anything is interpreted.
+     */
+    private static function anchorsAnArena(int $anchor): bool
+    {
+        return (int) Core::pointerAtAddress('uint64_t *', $anchor)[0] === Arena::MAGIC;
     }
 
     public function moduleStartup(): void
