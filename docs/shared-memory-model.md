@@ -178,8 +178,19 @@ What that costs, concretely:
   processes; they must be re-minted per process, by the same side-table mechanism §3
   describes for objects.
 
-Tracked as closure exchange in [#20]. Until then, cross-process work is passed as Task
-objects (data), not as callables.
+That is why provenance is **recorded rather than inferred**: `Ipc\ClosureProvenance` is a
+pre-sized table in the arena where the arena-owning process registers closures by name before
+it calls `markForkBarrier()`, and every registration after that moment — or from a worker — is
+refused. A registered closure travels as the address of its **record**; the closure object
+itself is never copied, because a pre-fork one needs no copy. Captures are held to the value
+contract at registration, and by-reference captures and declared statics are refused outright:
+after the fork each worker writes its own copy-on-write copy of such a slot, so the divergence
+would be silent.
+
+Arena-resident clones of **post-fork** closures remain out of scope; the inventory, the
+per-process slots that decide it and the verdict are in
+[closure-cloning.md](closure-cloning.md), tracked as Phase B of [#20]. Work created after the
+fork still travels as Task objects (data), not as callables.
 
 [#20]: https://github.com/lisachenko/php-shared-data-extension/issues/20
 
@@ -243,9 +254,10 @@ request end is repaired from the frozen image rather than left for a sibling to 
 
 Everything crossing a worker boundary is a **16-byte tagged record** — `uint8 tag | 7 pad |
 uint64 payload` — where the payload is the value itself for scalars and an *address* for
-strings, objects and shared arrays. A value with no address-shaped form (plain array,
-resource, non-shared object, closure) is refused with the remedy named, never encoded: that
-is the Never-Serialize Rule in one sentence.
+strings, objects, shared arrays and the records of registered closures. A value with no
+address-shaped form (plain array, resource, non-shared object, unregistered closure) is
+refused with the remedy named, never encoded: that is the Never-Serialize Rule in one
+sentence.
 
 - `SharedChannel` — a ring of records plus sender/receiver waiter tables under its **own**
   dedicated mutex (a structure locked on every operation does not belong on a shared stripe).
@@ -257,6 +269,8 @@ is the Never-Serialize Rule in one sentence.
   a `SharedError` (a persisted three-string object; a `Throwable` can never be shared);
 - `SharedMutex` / `AtomicInt` / `SharedWaitGroup` — robust locking, an aligned word with
   stripe-locked read-modify-write (FFI has no CAS), and a counter with waiters;
+- `ClosureProvenance` — the register of closures the family may invoke by address. It stores
+  provenance, not code: records in the arena, closures wherever they were compiled (§7);
 - `WakeRegistry` — one inherited socket pair per process. Sockets carry a fixed 16-byte event
   record (`opcode | tag | id | address`) and never a payload: **signalling, not
   serialization**. Waking is level-triggered and re-checked inside the critical section, so a
@@ -286,7 +300,7 @@ is the Never-Serialize Rule in one sentence.
 | String rewrites leak the previous bytes | consequence of §6; a content-keyed persistent intern table is the next iteration |
 | Direct `$obj->prop = ...` writes are unsynchronized | by design: the extension rewires shared objects to `std_object_handlers`, so there is no write hook. Scalar writes are visible but racy; a string/array/object written that way stores a request-heap pointer and is restored from the persisted image at detach. The synchronized path is `PersistentStore::mutableHandle()` |
 | The shared `handle` field is not the sentinel for a few instructions while a process detaches | inherent: recycling an object-store slot is an engine call and engine calls cannot run under an arena mutex. Nothing in the package reads that field — identity is `sharedIdOf()` (§3) |
-| Post-fork closures cannot be shared | [#20] (§7) |
+| Only closures registered before the fork barrier can be shared | by design (§7); post-fork closures need arena cloning — verdict and inventory in [closure-cloning.md](closure-cloning.md), Phase B of [#20] |
 | A borrowed `PersistentHashTable` view cannot re-adopt the external storage block it sits on, so the growth guard is re-derived in this package | z-engine seam follow-up; see the `TODO` in `Registry::assertRegistryRoom()` and [z-engine#223](https://github.com/lisachenko/z-engine/pull/223) |
 
 ---

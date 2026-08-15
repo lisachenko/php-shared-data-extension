@@ -38,14 +38,17 @@ final class NotShareableValueException extends \InvalidArgumentException
 
     public static function closure(): self
     {
-        return new self(
-            'A Closure cannot be shared. Sharing one by address is only safe when the function was ' .
-            'compiled BEFORE the fork barrier, and that provenance cannot be recovered from the object ' .
-            'itself: spike S17 observed a post-fork closure address that held a different, perfectly ' .
-            'valid Closure and executed the wrong function. Until closure exchange lands ' .
-            '(lisachenko/php-shared-data-extension#20), pass a shared Task object naming the work ' .
-            'instead of the callable that performs it.',
-        );
+        return new self(sprintf(
+            'This Closure is not registered as a shared one. Sharing a closure by address is only safe ' .
+            'when the function was compiled BEFORE the fork barrier, and that provenance cannot be ' .
+            'recovered from the object itself: spike S17 observed a post-fork closure address that held ' .
+            'a different, perfectly valid Closure and executed the wrong function. So provenance is ' .
+            'recorded rather than inferred - call %s::registerSharedClosure($name, $closure) in the ' .
+            'process that owns the arena, before it forks, and the closure travels as a record address ' .
+            'from then on. A closure created after the fork cannot be registered at all: hand that work ' .
+            'over as a shared Task object naming what to do instead of the callable that does it.',
+            ClosureProvenance::class,
+        ));
     }
 
     public static function resource(): self

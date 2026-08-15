@@ -27,8 +27,14 @@ use ZEngine\Type\StringEntry;
  * it that produces bytes describing a value: a scalar IS the payload word, a string becomes
  * an arena-resident zend_string and the payload is its address, an object and a shared array
  * contribute nothing but their address. Anything that has no address-shaped form - a plain
- * array, a resource, a closure, an object this worker family does not share - is refused
- * with NotShareableValueException rather than quietly encoded.
+ * array, a resource, an object this worker family does not share - is refused with
+ * NotShareableValueException rather than quietly encoded.
+ *
+ * A closure is the one value whose shareability is not decided by its type at all: it travels
+ * only if it was REGISTERED before the fork barrier (ClosureProvenance), and the payload is
+ * then the address of its arena record. Everything else about it - its class, its handlers,
+ * its op_array - is deliberately never examined, because a stale post-fork address was
+ * observed holding a valid Closure of a different function (EPIC #15, correction #8).
  *
  * ## Sending a string costs arena bytes
  *
@@ -51,13 +57,16 @@ use ZEngine\Type\StringEntry;
 final class ValueCodec
 {
     /**
-     * @param ArenaAllocator      $allocator Source of arena memory for string records
-     * @param PersistentStore|null $store    Registry that decides which objects are shared;
-     *                                       without one, object records cannot be built
+     * @param ArenaAllocator        $allocator Source of arena memory for string records
+     * @param PersistentStore|null  $store     Registry that decides which objects are shared;
+     *                                         without one, object records cannot be built
+     * @param ClosureProvenance|null $closures Register of closures compiled before the fork
+     *                                         barrier; without one, every closure is refused
      */
     public function __construct(
         private readonly ArenaAllocator $allocator,
         private readonly ?PersistentStore $store = null,
+        private readonly ?ClosureProvenance $closures = null,
     ) {
     }
 
@@ -74,6 +83,11 @@ final class ValueCodec
     public function store(): ?PersistentStore
     {
         return $this->store;
+    }
+
+    public function closures(): ?ClosureProvenance
+    {
+        return $this->closures;
     }
 
     /**
@@ -111,13 +125,14 @@ final class ValueCodec
     {
         return match ($tag) {
             ValueTag::Nil, ValueTag::Close => null,
-            ValueTag::True  => true,
-            ValueTag::False => false,
-            ValueTag::Int   => $payload,
-            ValueTag::Float => self::bitsToFloat($payload),
-            ValueTag::Str   => $this->readString($payload),
-            ValueTag::Obj   => $this->attachObject($payload),
-            ValueTag::Arr   => SharedArray::attach($this->allocator, $this, $payload),
+            ValueTag::True    => true,
+            ValueTag::False   => false,
+            ValueTag::Int     => $payload,
+            ValueTag::Float   => self::bitsToFloat($payload),
+            ValueTag::Str     => $this->readString($payload),
+            ValueTag::Obj     => $this->attachObject($payload),
+            ValueTag::Arr     => SharedArray::attach($this->allocator, $this, $payload),
+            ValueTag::Closure => $this->resolveClosure($payload),
         };
     }
 
@@ -152,8 +167,15 @@ final class ValueCodec
         if ($value instanceof \Closure) {
             // Provenance, never shape: a stale post-fork closure address can hold a valid
             // Closure of a DIFFERENT function (EPIC #15, correction #8), so inspection can
-            // never establish that sharing this one is safe
-            throw NotShareableValueException::closure();
+            // never establish that sharing this one is safe. The one provenance that IS
+            // sound is registration before the fork barrier, and it is a table lookup -
+            // nothing about the object is examined here either way
+            $record = $this->closures?->addressOfClosure($value);
+            if ($record === null) {
+                throw NotShareableValueException::closure();
+            }
+
+            return [ValueTag::Closure, $record];
         }
         if ($this->store === null) {
             throw NotShareableValueException::withoutStore($value::class);
@@ -165,6 +187,24 @@ final class ValueCodec
         }
 
         return [ValueTag::Obj, $address];
+    }
+
+    /**
+     * Rebuilds the closure a record describes, in the process that received the record
+     *
+     * The payload is the address of the arena RECORD, not of the closure: the record is what
+     * lives in shared memory and what proves the closure predates the fork. Resolving it is a
+     * bounds-checked table lookup followed by an integrity check on the object the record
+     * points at - see ClosureProvenance::resolve().
+     */
+    private function resolveClosure(int $address): \Closure
+    {
+        $this->assertShared($address);
+        if ($this->closures === null) {
+            throw NotShareableValueException::closure();
+        }
+
+        return $this->closures->resolve($address);
     }
 
     private function attachObject(int $address): object

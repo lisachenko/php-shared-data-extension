@@ -69,6 +69,18 @@ Two features share one persistent module:
    surviving the request boundary — counters, flags, fixed-size tables. See
    `demo.php`.
 
+### Feature map
+
+| What | Where |
+|---|---|
+| Persistent objects per worker, frozen by default | [How it works](#how-it-works), `PersistentStore::boot()` |
+| One `mmap` arena shared by a whole fork tree | [Fork-shared arena mode](#fork-shared-arena-mode-opt-in-experimental), `PersistentStore::bootShared()` |
+| Mutation the whole family sees, opt-in per graph | [Shared mutation](#shared-mutation-opt-in-per-graph), `mutableHandle()` |
+| Channels, shared arrays, result slots, locks, counters, wait groups | [IPC primitives](#ipc-primitives-in-the-arena-experimental), `Lisachenko\SharedData\Ipc` |
+| Closures invoked in several workers (registered before the fork) | [Shared closures](#shared-closures-registered-before-the-fork), `Ipc\ClosureProvenance` |
+| Why any of it is shaped this way — the laws, the measurements, the failure modes | [docs/shared-memory-model.md](docs/shared-memory-model.md) |
+| The rules a contributor (human or agent) must not break | [AGENTS.md](AGENTS.md) |
+
 ## How it works
 
 `persist(ClassName::class, $object)` deep-converts the whole object **graph**
@@ -122,7 +134,7 @@ identity or lifetime cannot outlive a request:
 | Rejected | Why |
 |---|---|
 | Resources | tied to request-scoped handles |
-| Closures | internal class carrying request-bound scope |
+| Closures | internal class carrying request-bound scope — share one with `Ipc\ClosureProvenance` instead of persisting it |
 | References | not supported yet |
 | Internal classes (`ArrayObject`, `stdClass`, …) | carry C state the engine frees per request |
 | Enums | enum case identity is per-request |
@@ -332,11 +344,12 @@ $value = $results->await($slot)->value;                 // read straight out of 
 
 Values move as **16-byte records**: `uint8 tag | 7 pad | uint64 payload`, where the payload
 is the value itself (`int`, `float`, nothing at all for `null`/`bool`) or an arena address
-(an interned `zend_string`, a shared `zend_object`, a `SharedArray`). A value with no
-address-shaped form — a plain array, a resource, a closure, an object this family does not
-share — is refused with `NotShareableValueException` naming the remedy. Nothing is ever
-encoded: there is no `serialize()`, igbinary or JSON on any data path, and the test suite
-proves it by shadowing every encoding function in the package's namespaces.
+(an interned `zend_string`, a shared `zend_object`, a `SharedArray`, the record of a shared
+closure). A value with no address-shaped form — a plain array, a resource, an object this
+family does not share, a closure nobody registered — is refused with
+`NotShareableValueException` naming the remedy. Nothing is ever encoded: there is no
+`serialize()`, igbinary or JSON on any data path, and the test suite proves it by shadowing
+every encoding function in the package's namespaces.
 
 The sockets carry **only** fixed 16-byte event records `{opcode, tag, slot/channel id,
 address}` — signalling, never payload; a scalar's record carries a zero where an address
@@ -359,10 +372,54 @@ a package with no scheduler can offer: every primitive also exposes its non-bloc
 (`trySend()`/`tryRecv()`/`tryLock()`/`readSlot()`) plus `notificationStream()`, so a
 coroutine runtime can park a Fiber in its own event loop instead.
 
+### Shared closures (registered before the fork)
+
+A closure compiled **before the fork** is valid in every worker: the family inherited the
+memory it lives in, so its address means the same function everywhere. A closure compiled
+*after* the fork is the opposite, and it does not fail loudly — a stale address was observed
+holding a different, perfectly valid `Closure` that then executed the wrong function. Nothing
+about the object tells the two apart, so this package decides on **provenance** and never on
+inspection: a closure travels if, and only if, it was registered before the fork barrier.
+
+```php
+use Lisachenko\SharedData\Ipc\ClosureProvenance;
+
+$closures = ClosureProvenance::create($allocator, $store);      // pre-fork, like the arena
+$factor   = 3;
+
+$record = $closures->registerSharedClosure('scale', static fn (int $n): int => $n * $factor);
+$closures->markForkBarrier();                                   // registration closes here
+
+if (pcntl_fork() === 0) {
+    $scale = $closures->resolve($record);                       // or ->closure('scale')
+    exit($scale(14) === 42 ? 0 : 1);                            // runs in this worker
+}
+$jobs->send($closures->closure('scale'));                       // travels as a record address
+```
+
+The record — closure address, function witness, name, bound `$this` — lives in the arena; the
+closure itself is never copied. What is refused, with the reason named: registering after the
+barrier or from a worker, a bound `$this` that is not a shared object, a captured plain array
+or request object, a capture by reference and a declared `static` variable (each worker would
+copy-on-write its own copy of those slots and diverge in silence). Cloning *post-fork* closures
+into the arena is a separate problem with its own verdict —
+[docs/closure-cloning.md](docs/closure-cloning.md).
+
 ### Deployment model
 
-- **Scope: one worker process.** This is per-process persistent memory, not
-  cross-process shared memory. Each FPM/RoadRunner worker has its own copy.
+- **Scope: a fork tree, not a single process.** The default store is per-worker
+  persistent memory — each FPM/RoadRunner worker builds its own copy. Arena mode
+  widens that to **one family of processes descended from one parent**: the
+  region is mapped before the fork, so every worker sees the same objects at the
+  same addresses. Attaching from an *unrelated* process is permanently out of
+  scope — class entries, object handlers and the arena base would all differ,
+  and none of that fails loudly.
+- **Frozen by default, mutable by opt-in.** A persisted graph rolls its
+  request-time mutations back at shutdown unless you pass `mutable: true`, which
+  trades the rollback for state the whole family keeps.
+- **Signalling is separate from data.** IPC primitives (channels, shared arrays,
+  result slots, locks, counters, wait groups) live in the arena; sockets carry
+  fixed 16-byte event records only.
 - **Blessed setups**: worker loops (RoadRunner, FrankenPHP worker mode, Swoole)
   or classic FPM with **`opcache.preload`** (stable class entries). Without
   preload, classes are rebound by name on `attach()` and a property-layout
@@ -422,6 +479,13 @@ $slots = ResultSlotTable::create($allocator, $codec, $wake, $capacity);
 $slots->allocateSlot(): int;
 $slots->complete($id, $value): void;                  // completePanic($id, SharedError::capture(...))
 $slots->await($id, $timeout): SlotResult;             // readSlot() never blocks
+
+// shared closures (registration is the acceptance test; everything else is refused)
+$closures = ClosureProvenance::create($allocator, $store);   // pre-fork
+$closures->registerSharedClosure($name, $closure): int;      // returns the record address
+$closures->markForkBarrier(): void;                          // closes registration for the family
+$closures->closure($name): Closure;                          // resolve($address) by address
+$codec = new ValueCodec($allocator, $store, $closures);      // lets registered closures travel
 ```
 
 ## Testing
@@ -436,7 +500,9 @@ php -d ffi.enable=1 demos/demo-objects.php
 php -d ffi.enable=1 demo.php             # original shared C data demo
 ```
 
-CI runs all of the above on every push and pull request.
+CI runs all of the above on every push and pull request, on PHP 8.4 and 8.5.
+`spikes/` holds the runnable evidence behind the engine claims this package
+rests on; [AGENTS.md](AGENTS.md) states the rules a change has to keep.
 
 ## Requirements
 
