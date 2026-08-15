@@ -233,6 +233,30 @@ final class PersistentStore
     }
 
     /**
+     * The store booted for $moduleName during this request, if any
+     *
+     * How a module reaches its own state without interpreting its globals: in arena mode
+     * globals[0] is an ARENA BASE, and reading it as a registry pointer would dereference
+     * the arena header as a hashtable. The live store knows which registry it holds and how
+     * it was built, so anything that wants to REPORT on the state (phpinfo(), diagnostics)
+     * asks here first.
+     */
+    public static function activeStore(string $moduleName): ?self
+    {
+        return self::$activeStores[$moduleName] ?? null;
+    }
+
+    /**
+     * Storage keys of every graph this store holds
+     *
+     * @return list<string>
+     */
+    public function entryNames(): array
+    {
+        return $this->registry->names();
+    }
+
+    /**
      * Detaches every store booted during this request (idempotent per store)
      *
      * Invoked by ObjectPersistenceModule::requestShutdown() as the belt-and-braces
@@ -413,6 +437,31 @@ final class PersistentStore
         $entry = $this->registry->findEntry($className);
 
         return $entry?->root();
+    }
+
+    /**
+     * Address of an instance, if THIS store's registry is the one that shares it
+     *
+     * The predicate behind every "may this value cross a worker boundary?" decision: an
+     * ordinary request object, a persistent clone minted by another registry and an object
+     * whose entry was dropped all answer null, and only a null-free answer is an address a
+     * sibling process may follow. Note what is deliberately not used here - the object's
+     * handle, which forked children hand out identically for different objects (EPIC #15,
+     * correction #4); identity in the shared area is the ARENA ADDRESS and nothing else.
+     *
+     * @return int|null Address of the shared zend_object, or null when it is not shared
+     */
+    public function addressOfInstance(object $instance): ?int
+    {
+        $value = new ReflectionValue($instance);
+
+        try {
+            $address = Core::addressOf($value->getRawObject());
+        } finally {
+            $value->release();
+        }
+
+        return $this->registry->findObject($address) !== null ? $address : null;
     }
 
     /**
