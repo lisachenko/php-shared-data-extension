@@ -4,11 +4,11 @@ Throwaway-by-intent programs, kept because their *answers* are load-bearing. Eve
 the fork-shared arena rests on behaviour that no documentation guarantees — whether a
 `pthread_mutex_t` in `MAP_SHARED` memory really excludes another process, what the engine
 does when it grows a hashtable that lives in somebody else's memory, whether a `zval` write
-in one process is visible in another. These files are how those questions were answered, and
-their logs are the evidence.
+in one process is visible in another. These files are how those questions were answered.
 
 They are not part of the test suite: they fork, kill and SIGABRT on purpose, and several of
-them are supposed to crash. Run them by hand.
+them are supposed to crash. Run them by hand, from the repository root; they bootstrap
+through Composer's autoloader and nothing else.
 
 ```bash
 php8.4 -d ffi.enable=1 -d opcache.jit=off spikes/s8-robust-pshared-mutex.php
@@ -25,11 +25,14 @@ php8.4 -d ffi.enable=1 -d opcache.jit=off spikes/s15-concurrent-bump-allocation.
 Both run against this package's own `Arena`, so they double as end-to-end checks of the
 class the rest of the epic builds on.
 
-## Validation spikes (`c1/`)
+## The wider validation sweep (not in this repository)
 
-The wider validation sweep that established the premise of EPIC #15, run on PHP 8.4 **and**
-8.5 with captured logs in `c1/out/`. `c1/verdicts.md` is the full write-up; the findings that
-bind this ticket's implementation:
+The sweep that established the premise of EPIC #15 (S12–S17) ran on PHP 8.4 **and** 8.5
+before this package had an arena of its own, so it carried its own bootstrap and resolved
+z-engine from outside the repository — nothing that can be run from a checkout, and nothing
+any later work needs as context. Its verdicts are recorded where they belong, on the ticket:
+[the spike gate on #15](https://github.com/lisachenko/php-shared-data-extension/issues/15#issuecomment-5303807403).
+The findings that bind the implementation, restated here so the code has something to cite:
 
 - **S12** — an engine-formatted `zend_object` in arena memory attaches as an ordinary PHP
   instance in several processes at once, and scalar property writes are visible immediately
@@ -51,6 +54,6 @@ bind this ticket's implementation:
 - **S16/S17** — arena-interned strings swap safely under a pointer store; closures are only
   fork-safe when they existed before the fork (E5).
 
-`c1/run-all.sh` reruns the sweep on both minors; it resolves the 8.5 line of z-engine from a
-scratch clone, which is why the 8.5 leg is CI's job rather than something reproducible from
-this checkout alone.
+The claims that this package depends on are not left resting on that sweep: S12/S14/S16 are
+promoted to real tests in `tests/Shm/` (mutation visibility, per-process side table, unlocked
+pointer reads), which is where they are re-run on both minors on every change.
