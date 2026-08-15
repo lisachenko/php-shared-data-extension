@@ -29,7 +29,7 @@ use ZEngine\EngineExtension\ModuleLifecycleInterface;
  *       HashTable in the default mode, the ARENA BASE in arena mode
  *       (PersistentStore::bootShared - the registry tables are then found through the
  *       arena's own roots directory, which is all a forked child can rely on)
- *   [1] layout version of the registry format (Registry::LAYOUT_VERSION, currently 4),
+ *   [1] layout version of the registry format (Registry::LAYOUT_VERSION, currently 5),
  *       written when the registry is created and verified on every later boot - a worker
  *       holding a registry from an older build is rejected instead of misread
  *

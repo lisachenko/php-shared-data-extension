@@ -41,6 +41,8 @@ use ZEngine\Type\StringEntry;
  *                  'shares'    => IS_LONG   number of entries referencing this object
  *                  'arrays'    => IS_PTR    index => IS_PTR sealed array HashTable*
  *                                           (allocation list owned by this object)
+ *                  'mutable'   => IS_LONG   1 when the object belongs to a SHARED MUTABLE
+ *                                           graph, 0 for the frozen default
  *
  * ## Where those tables live: process heap, or the fork-shared arena
  *
@@ -94,8 +96,11 @@ final class Registry
      *   v4 - the same shape, but the tables may live in a fork-shared arena instead of the
      *        process heap (blocks the engine must never grow and this process must never
      *        free), and globals[0] then anchors the ARENA rather than the registry
+     *   v5 - object records carry their ROLE ('mutable'): a shared graph that opted into
+     *        mutation is never rolled back at request end, and a worker that cannot read the
+     *        role would apply frozen semantics to memory its siblings are writing
      */
-    public const LAYOUT_VERSION = 4;
+    public const LAYOUT_VERSION = 5;
 
     /**
      * Sign correction for nTableMask, which the engine declares unsigned and uses signed
@@ -400,6 +405,10 @@ final class Registry
         self::addInternedString($meta, 'signature', $object->signature, $this->allocator);
         self::addLong($meta, 'shares', 0, $this->allocator);
         self::addPointer($meta, 'arrays', $arrays->getRawValue(), $this->allocator);
+        // The role travels with the object, not with the process that persisted it: a sibling
+        // attaching this address later has to learn from the registry alone whether rolling
+        // the slots back at request end would destroy somebody's live writes
+        self::addLong($meta, 'mutable', $object->mutable ? 1 : 0, $this->allocator);
 
         $object->shares      = 0;
         $object->metaTable   = $meta->getRawValue();
@@ -432,6 +441,7 @@ final class Registry
         $meta->find('class')->getNativeValue($className);
         $meta->find('signature')->getNativeValue($signature);
         $meta->find('shares')->getNativeValue($shares);
+        $meta->find('mutable')->getNativeValue($mutable);
 
         $arraysTable = self::tableAt($meta, 'arrays');
 
@@ -450,6 +460,7 @@ final class Registry
             $shares,
             $meta->getRawValue(),
             $arraysTable->getRawValue(),
+            $mutable === 1,
         );
     }
 

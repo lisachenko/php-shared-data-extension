@@ -40,6 +40,12 @@ final class PersistedObject
      * @param int          $shares      Number of registry ENTRIES whose members include this object
      * @param CData|null   $metaTable   HashTable* of the persisted metadata record (null until stored)
      * @param CData|null   $arraysTable HashTable* of the allocation list itself (null until stored)
+     * @param bool         $mutable     Whether this object belongs to a SHARED MUTABLE graph:
+     *                                  its slots are written by any process of the family
+     *                                  through the stripe lock, and detach() must therefore
+     *                                  never roll them back to the snapshot. Recorded in the
+     *                                  registry (not in this process), so every worker reads
+     *                                  the same role for the same object
      */
     public function __construct(
         public int $address,
@@ -51,6 +57,7 @@ final class PersistedObject
         public int $shares = 0,
         public ?CData $metaTable = null,
         public ?CData $arraysTable = null,
+        public bool $mutable = false,
     ) {
     }
 }

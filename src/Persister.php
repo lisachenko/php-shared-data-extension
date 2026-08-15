@@ -172,6 +172,23 @@ final class Persister
     }
 
     /**
+     * Property slots of a class entry, in properties_table order
+     *
+     * The same mapping the conversion below walks, exposed because writing one property of a
+     * shared object means writing one SLOT of it: the mutation API has to resolve a name to a
+     * slot index exactly as the persister does, and against the class entry of the process
+     * doing the writing.
+     *
+     * @param CData $classType zend_class_entry* of the process that is asking
+     *
+     * @return array<int, string> slot index => declared property name
+     */
+    public static function propertySlots(CData $classType): array
+    {
+        return self::declaredPropertyNames($classType);
+    }
+
+    /**
      * Converts one graph object, or returns the clone minted for it earlier
      *
      * @param CData  $rawObject zend_object* of the SOURCE object (the map key)

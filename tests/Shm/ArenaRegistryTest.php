@@ -42,10 +42,12 @@ class ArenaRegistryTest extends TestCase
         return [$arena, new ArenaAllocator($arena)];
     }
 
-    public function testLayoutVersionIsFour(): void
+    public function testLayoutVersionIsFive(): void
     {
-        // The version the module globals are checked against; arena tables are what v4 adds
-        $this->assertSame(4, Registry::LAYOUT_VERSION);
+        // The version the module globals are checked against: v4 added arena tables, v5 the
+        // per-object role, without which a worker would apply frozen semantics to a mutable
+        // graph its siblings are writing
+        $this->assertSame(5, Registry::LAYOUT_VERSION);
     }
 
     public function testTablesArePublishedInTheArenaRootsDirectory(): void
