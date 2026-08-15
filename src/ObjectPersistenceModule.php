@@ -13,6 +13,8 @@ declare(strict_types=1);
 
 namespace Lisachenko\SharedData;
 
+use Lisachenko\SharedData\Shm\Arena;
+use ZEngine\Core;
 use ZEngine\EngineExtension\AbstractModule;
 use ZEngine\EngineExtension\ModuleDependency;
 use ZEngine\EngineExtension\ModuleInfoInterface;
@@ -106,8 +108,16 @@ final class ObjectPersistenceModule extends AbstractModule implements ModuleInfo
     {
         $names       = [];
         $objectCount = 0;
+        $store       = PersistentStore::activeStore($this->getName());
         $globals     = $this->getGlobals();
-        if ($globals !== null && $globals[0] !== 0) {
+
+        if ($store !== null) {
+            // The live store knows which registry it holds - and in arena mode it is the
+            // ONLY thing that does: globals[0] is the arena base there, so reading it as a
+            // registry pointer would dereference the arena header as a hashtable
+            $names       = $store->entryNames();
+            $objectCount = $store->objectCount();
+        } elseif ($globals !== null && $globals[0] !== 0 && !self::anchorsAnArena($globals[0])) {
             $registry    = Registry::fromAddress($globals[0]);
             $names       = $registry->names();
             $objectCount = $registry->objectCount();
@@ -119,6 +129,18 @@ final class ObjectPersistenceModule extends AbstractModule implements ModuleInfo
             'Persisted object clones'    => $objectCount,
             'Persisted entry names'      => $names === [] ? '(none)' : implode(', ', $names),
         ];
+    }
+
+    /**
+     * Whether the module anchor points at an ARENA rather than at a registry hashtable
+     *
+     * The last line of defence for a reporting path that runs without a live store: an
+     * arena starts with its magic word, a registry with an ordinary hashtable header, so
+     * one aligned load tells the two apart before anything is interpreted.
+     */
+    private static function anchorsAnArena(int $anchor): bool
+    {
+        return (int) Core::pointerAtAddress('uint64_t *', $anchor)[0] === Arena::MAGIC;
     }
 
     public function moduleStartup(): void
