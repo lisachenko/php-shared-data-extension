@@ -190,6 +190,50 @@ final class WakeRegistry
     }
 
     /**
+     * The pid that currently owns $slot, or 0 when the slot is free
+     *
+     * A single aligned word read and no lock: the claim table is one word per entry, and an
+     * aligned 8-byte load never tears (EPIC #15, correction #2), so the answer is either the
+     * old owner or the new one and never a mixture of the two.
+     */
+    public function ownerOf(int $slot): int
+    {
+        if ($slot < 0 || $slot >= $this->capacity) {
+            return 0;
+        }
+
+        return (int) $this->arena->readWord($this->entryAddress($slot));
+    }
+
+    /**
+     * Whether $slot is still held by $pid and $pid is still running
+     *
+     * This is the liveness test a structure holding LONG-LIVED registrations needs: a waiter
+     * parked inside a blocking call always takes its entry back on the way out, but a
+     * registration made from a consumer's own event loop survives the process that made it,
+     * and on a rendezvous channel a surviving registration is the difference between "a
+     * partner is present" and "nobody is there".
+     *
+     * Both halves of the check matter. The pid may be gone; or the pid may be gone AND its
+     * slot already recycled to a new worker, which is a live process that never registered
+     * anywhere - so the claim table has to agree that this pid still owns this slot.
+     *
+     * **Makes a syscall, so it is never called from inside a critical section.** Callers scan
+     * lock-free, then re-verify what they found under the structure's lock before acting on it
+     * (the same shape claim() uses for its own scan).
+     */
+    public function isOwnerAlive(int $slot, int $pid): bool
+    {
+        if ($pid <= 0) {
+            // No owner was recorded: the entry belongs to a caller that releases it itself,
+            // so there is nothing here that could ever go stale
+            return true;
+        }
+
+        return $this->ownerOf($slot) === $pid && self::isAlive($pid);
+    }
+
+    /**
      * Sends one event to a parked process
      */
     public function notify(int $slot, WakeEvent $event): void

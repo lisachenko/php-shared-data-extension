@@ -67,6 +67,18 @@ final class IpcException extends \RuntimeException
         ));
     }
 
+    public static function waiterTableFull(string $role, int $capacity): self
+    {
+        return new self(sprintf(
+            'The %s waiter table of this channel is full: all %d entries hold a registration. Waiter ' .
+            'tables are pre-sized in the arena and never grow - a grown table would be reallocated ' .
+            'into one process\'s private heap - so create the channel with a larger waiterCapacity ' .
+            'before the workers fork.',
+            $role,
+            $capacity,
+        ));
+    }
+
     public static function invalidCapacity(string $structure, int $capacity): self
     {
         return new self(sprintf('%s capacity must be a positive number of records, got %d', $structure, $capacity));
