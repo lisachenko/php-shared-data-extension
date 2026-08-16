@@ -138,6 +138,12 @@ final class Arena
     private const int MAX_ALIGNMENT = 4096;
 
     /**
+     * Bytes the kernel materializes per fault; only prefault() cares, and only to space its
+     * stores out. A host with larger pages simply gets a few redundant stores, never a miss.
+     */
+    private const int PAGE_SIZE = 4096;
+
+    /**
      * Offsets of the fields inside one roots-directory entry, in words
      */
     private const int ROOT_WORD_HASH    = 0;
@@ -368,6 +374,46 @@ final class Arena
         }
 
         return $this->baseAddress + $aligned;
+    }
+
+    /**
+     * Makes every page of a block resident now, instead of one fault at a time later
+     *
+     * The mapping is MAP_ANONYMOUS, so its pages exist only once something writes to them. For
+     * a structure that is filled in gradually over the life of a run - a result-slot table
+     * handing out one slot per spawn is the case that motivated this - that turns a table that
+     * was PRE-SIZED before the fork into one whose cost arrives a page at a time for hours.
+     * Nothing about the arena grows, so no watermark and no allocator counter moves, yet the
+     * process's RSS climbs with the workload and every memory gate reads it as a leak
+     * (native-php-coroutines#24).
+     *
+     * Touching the pages up front is the honest fix rather than a suppression: the memory was
+     * always going to be resident, this only decides whether it is charged at creation or
+     * spread across the run, and afterwards a climb really is a climb.
+     *
+     * Call it from the creating process **before the fork**. The block is freshly bumped and
+     * therefore already zero, so the write stores a zero over a zero and changes nothing; the
+     * pages are shared, so the family pays for them once.
+     *
+     * @param int $address Start of the block, as returned by allocate()
+     * @param int $length  Bytes to make resident
+     */
+    public function prefault(int $address, int $length): void
+    {
+        $this->assertRange($address, $length);
+
+        // One store per page is what the kernel needs to materialize it; a memcpy over the whole
+        // block would do the same thing and cost a PHP string the size of the table. The first
+        // touch is at $address rather than at its page boundary, which may belong to the block
+        // allocated before this one.
+        $end  = $address + $length;
+        $word = $address & ~7;
+
+        while ($word + 8 <= $end) {
+            $this->words[($word - $this->baseAddress) >> 3] = 0;
+
+            $word = ($word + self::PAGE_SIZE) & ~(self::PAGE_SIZE - 1);
+        }
     }
 
     /**
