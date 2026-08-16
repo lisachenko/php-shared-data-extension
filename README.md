@@ -332,7 +332,7 @@ $wake      = WakeRegistry::create($arena);              // socket pairs, created
 $jobs      = SharedChannel::create($allocator, $codec, $wake, 64, name: 'jobs');
 $results   = ResultSlotTable::create($allocator, $codec, $wake, 1024);
 
-$slot = $results->allocateSlot();
+$slot = $results->allocateSlot();                       // a TICKET: slot index + generation
 if (pcntl_fork() === 0) {
     [$job, $ok] = $jobs->recv();                        // parks on the socket, wakes on an event
     $results->complete($slot, process($job));           // writes a record, pokes the waiter
@@ -340,7 +340,18 @@ if (pcntl_fork() === 0) {
 }
 $jobs->send($sharedObject);                             // an address, never a copy
 $value = $results->await($slot)->value;                 // read straight out of shared memory
+$results->releaseSlot($slot);                           // read and done with: back on the free list
 ```
+
+**Slots are recycled, and a slot id is a ticket rather than an index.** The arena is bump-only
+and nothing frees a block, so `releaseSlot()` reuses the slot *record in place* through a free
+list threaded through the slots themselves. What makes that safe is the generation packed
+beside the index in every id (`Ipc\SlotTicket`, 16 bits each, so the whole thing still fits the
+uint32 a wake event carries): the generation moves the instant an owner releases its claim, and
+reading, awaiting, completing or releasing a slot with an out-of-date ticket is an
+`IpcException` naming the slot and both generations — never another task's result. A slot
+nobody releases simply stays out of circulation, and a slot whose 16-bit generation is used up
+is retired rather than wrapped, so no handle is ever revived by a counter coming back round.
 
 Values move as **16-byte records**: `uint8 tag | 7 pad | uint64 payload`, where the payload
 is the value itself (`int`, `float`, nothing at all for `null`/`bool`) or an arena address
@@ -361,7 +372,7 @@ lost, and every blocking loop also re-polls on a bounded slice.
 |---|---|
 | `SharedChannel` | ring of records + waiter tables under a dedicated robust mutex; capacity 0 is a true cross-process rendezvous; `close()` crosses processes (receivers drain, then `[null, false]`; senders throw) |
 | `SharedArray` | fixed-capacity vector of records, `ArrayAccess`/`Countable`/`IteratorAggregate`, stripe-locked |
-| `ResultSlotTable` | futures: `allocateSlot()` / `complete()` / `completePanic()` / `await()`, with panics travelling as a shared `SharedError` object |
+| `ResultSlotTable` | futures: `allocateSlot()` / `complete()` / `completePanic()` / `await()` / `releaseSlot()`, ids carrying a generation so a recycled slot never answers an old handle, and panics travelling as a shared `SharedError` object |
 | `SharedMutex` | robust process-shared mutex with trylock-and-backoff, `EOWNERDEAD` recovered and reported |
 | `AtomicInt` | one shared cell: plain aligned get/set, stripe-locked `add()`/`compareAndSet()` |
 | `SharedWaitGroup` | counter plus waiter table; `add()`/`done()`/`wait()`, negative counts throw |
@@ -497,9 +508,11 @@ $channel->recv($timeout): array;                      // [value, true] | [null, 
 $channel->close(): void;                              // crosses processes, drains first
 $channel->notificationStream();                       // park your own event loop on this
 $slots = ResultSlotTable::create($allocator, $codec, $wake, $capacity);
-$slots->allocateSlot(): int;
-$slots->complete($id, $value): void;                  // completePanic($id, SharedError::capture(...))
-$slots->await($id, $timeout): SlotResult;             // readSlot() never blocks
+$slots->allocateSlot(): int;                          // a ticket: SlotTicket::indexOf()/generationOf()
+$slots->complete($ticket, $value): void;              // completePanic($ticket, SharedError::capture(...))
+$slots->await($ticket, $timeout): SlotResult;         // readSlot() never blocks
+$slots->releaseSlot($ticket): void;                   // settled + read => back on the free list
+$slots->outstanding(); $slots->highWaterMark();       // what a soak watches plateau
 
 // shared closures (registration is the acceptance test; everything else is refused)
 $closures = ClosureProvenance::create($allocator, $store);   // pre-fork

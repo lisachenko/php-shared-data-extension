@@ -198,7 +198,7 @@ class ResultSlotForkTest extends IpcTestCase
         $slots->allocateSlot();
 
         $this->expectException(IpcException::class);
-        $this->expectExceptionMessageMatches('/pre-sized in the arena and never grows/');
+        $this->expectExceptionMessageMatches('/All 2 result slots are in use/');
 
         $slots->allocateSlot();
     }

@@ -19,6 +19,10 @@ namespace Lisachenko\SharedData\Ipc;
  * The value is built from the shared record AFTER the slot lock is released, so a SlotResult
  * is an ordinary request-scoped value object. For a PANIC it carries the shared error-info
  * object (see SharedError), which is a real object in the arena and not a rendered message.
+ *
+ * `$id` is the {@see SlotTicket} the read was made with - slot index and generation - not a bare
+ * index, so it can be handed straight back to readSlot(), await() or releaseSlot() and stays a
+ * claim on THIS result rather than on whatever the slot holds later.
  */
 final class SlotResult
 {
