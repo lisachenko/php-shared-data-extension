@@ -274,6 +274,25 @@ class SharedChannelForkTest extends IpcTestCase
         $this->assertFalse($channel->trySend('after cancelling'), 'a cancelled registration still gated a send');
     }
 
+    public function testCancellingAnAlreadyFreeRegistrationDoesNotDriveTheParkedCountNegative(): void
+    {
+        $channel = $this->channel(0);
+
+        $token = $channel->registerReceiver();
+        $this->assertNotNull($token);
+
+        $channel->cancelReceiver($token);
+        $channel->cancelReceiver($token);
+
+        $this->assertSame(0, $channel->parkedReceivers());
+
+        // And the channel still works: the count was not corrupted by the repeat
+        $again = $channel->registerReceiver();
+        $this->assertNotNull($again);
+        $this->assertSame(1, $channel->parkedReceivers());
+        $this->assertTrue($channel->trySend('still a partner'));
+    }
+
     public function testARecordDepositedAgainstACancelledRegistrationStaysForTheNextReceiver(): void
     {
         $channel = $this->channel(0);

@@ -802,6 +802,13 @@ final class SharedChannel
 
     /**
      * Deregisters a waiter entry, under the lock, and drops the parked counter with it
+     *
+     * An entry that is already free is left alone rather than counted down again: a token
+     * outlives the call that made it, so a repeated cancel is a mistake a caller can actually
+     * make, and a parked count driven below the truth would close a rendezvous gate that should
+     * be open. This is not a licence to cancel twice - a token that has been cancelled must be
+     * dropped, because the entry it names may by then hold a NEW registration, which a second
+     * cancel would withdraw.
      */
     private function unpark(WaiterTable $table, ?int $entry, int $counterWord): void
     {
@@ -811,8 +818,10 @@ final class SharedChannel
 
         $recovered = $this->arena->lockMutexAt($this->mutex);
 
-        $table->release($entry);
-        $this->setWord($counterWord, max($this->word($counterWord) - 1, 0));
+        if ($table->wordAt($entry) !== 0) {
+            $table->release($entry);
+            $this->setWord($counterWord, max($this->word($counterWord) - 1, 0));
+        }
 
         $this->arena->unlockMutexAt($this->mutex);
 
