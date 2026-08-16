@@ -40,12 +40,16 @@ use ZEngine\Type\TypeOperationException;
  *      (frozen semantics), releases request-owned caches and hides the objects from
  *      teardown.
  *
- * A persisted entry is a whole object GRAPH (see Persister), keyed by a class-string. The
- * graph is described as a list of MEMBER objects living in one process-wide object table,
- * so entries may share members: persisting an object that already belongs to another entry
- * references the existing clone instead of copying it, and identity holds across entries
- * and across requests. Every object counts how many entries reference it, which is what
- * lets drop() reclaim memory without ever pulling an object out from under a live graph.
+ * A persisted entry is a whole object GRAPH (see Persister), keyed by a NAME. The name is
+ * whatever the caller wants to find the graph by later: passing `::class` is the convention
+ * for a typed singleton (`$store->get(AppConfig::class)` then infers its type), and
+ * persistInstance() mints a name from the graph's own root address for graphs that are many
+ * per class and looked up by address rather than by name. The graph is described as a list
+ * of MEMBER objects living in one process-wide object table, so entries may share members:
+ * persisting an object that already belongs to another entry references the existing clone
+ * instead of copying it, and identity holds across entries and across requests. Every
+ * object counts how many entries reference it, which is what lets drop() reclaim memory
+ * without ever pulling an object out from under a live graph.
  *
  * persist() returns a NEW canonical persistent instance: zvals embed zend_object
  * pointers directly, so existing references to the source object cannot be retargeted.
@@ -77,6 +81,16 @@ final class PersistentStore
     public const int SHARED_HANDLE_SENTINEL = 0xFFFFFFFF;
 
     /**
+     * First byte of every name persistInstance() mints, refused in caller-chosen names
+     *
+     * The reservation is what keeps the two keying schemes from colliding: an instance
+     * graph's name is derived from its root address, so a caller-chosen name that could
+     * spell the same string would let an ordinary persist() silently upsert - that is,
+     * release - a graph some other process is still reading by address.
+     */
+    private const string INSTANCE_PREFIX = '@';
+
+    /**
      * Stores booted during this request, keyed by module name (request-scoped: PHP
      * statics reset per request, exactly like the shutdown functions the stores arm)
      *
@@ -88,7 +102,7 @@ final class PersistentStore
 
     private Persister $persister;
 
-    /** @var array<class-string, object> Materialized canonical graph roots for this request */
+    /** @var array<string, object> Materialized canonical graph roots for this request */
     private array $instances = [];
 
     /**
@@ -319,12 +333,16 @@ final class PersistentStore
      * are referenced rather than copied: a graph may reach into another entry's graph,
      * and both entries then own the shared objects jointly.
      *
-     * Storage is keyed by class (or interface) name, so static analyzers infer the
-     * instance type from the key: `$store->get(AppConfig::class)` is an AppConfig. The
-     * instance is immediately live for the current request; on later requests it is
+     * Storage is keyed by NAME - any non-empty string the caller wants to find the graph
+     * by later. Passing `::class` is the convention for a typed singleton, and it is what
+     * keeps `$store->get(AppConfig::class)` inferring its type; but the key carries no
+     * class semantics of its own, so two instances of one class live happily under two
+     * names. A graph that is many-per-class and never looked up by name belongs to
+     * {@see self::persistInstance()} instead, which mints the name from the root address.
+     * The instance is immediately live for the current request; on later requests it is
      * re-materialized by attach() under the same key.
      *
-     * Persisting over an existing key is an upsert: the previous graph is released with
+     * Persisting over an existing name is an upsert: the previous graph is released with
      * exactly the same accounting as drop(), including the alias-safety check - so a
      * request that still holds instances of objects only the previous graph referenced
      * gets a RuntimeException instead of freed memory under its feet.
@@ -346,26 +364,93 @@ final class PersistentStore
      *
      * @template T of object
      *
-     * @param class-string<T> $className Storage key; the object must be an instance of it
-     * @param T               $object
-     * @param bool            $mutable   Persist as a SHARED MUTABLE graph (arena mode only)
+     * @param string $name    Storage key; `::class` by convention for a typed singleton
+     * @param T      $object
+     * @param bool   $mutable Persist as a SHARED MUTABLE graph (arena mode only)
      *
      * @return T The canonical persistent instance
      */
-    public function persist(string $className, object $object, bool $mutable = false): object
+    public function persist(string $name, object $object, bool $mutable = false): object
     {
-        if (!$object instanceof $className) {
+        if ($name === '' || $name[0] === self::INSTANCE_PREFIX) {
             throw new \InvalidArgumentException(sprintf(
-                'Storage key %s must name a class or interface of the persisted instance %s',
-                $className,
-                get_class($object),
+                "'%s' cannot name a persisted graph: the empty name names nothing, and the '%s' "
+                . 'prefix is reserved for instance graphs, whose names persistInstance() mints '
+                . 'from their own root address',
+                $name,
+                self::INSTANCE_PREFIX,
             ));
         }
         if ($mutable && $this->allocator === null) {
-            throw SharedMutationException::requiresSharedMode($className);
+            throw SharedMutationException::requiresSharedMode($name);
         }
         $this->attach();
 
+        /** @var T */
+        return $this->storeUnder($name, $this->convert($name, $object, $mutable));
+    }
+
+    /**
+     * Persists a graph under a name minted from its own root address
+     *
+     * The per-instance counterpart of persist(): where a name is a slot one graph occupies
+     * at a time - persisting a second AppConfig under `AppConfig::class` supersedes the
+     * first - an instance graph is one of MANY. A parallel task, a captured panic, a job
+     * payload: each instance gets its own entry, none upserts another, and any number of
+     * the same class are live at once. Nothing here is looked up by a name the caller
+     * chose; the graph's identity is its root's address ({@see self::sharedIdOf()}), which
+     * is exactly what the minted name records.
+     *
+     * Persisting an already-shared root again is idempotent: it resolves to the same name,
+     * and the generic upsert accounting nets every member's share count out unchanged.
+     *
+     * @template T of object
+     *
+     * @param T    $object
+     * @param bool $mutable Persist as a SHARED MUTABLE graph (arena mode only)
+     *
+     * @return T The canonical persistent instance
+     */
+    public function persistInstance(object $object, bool $mutable = false): object
+    {
+        if ($mutable && $this->allocator === null) {
+            throw SharedMutationException::requiresSharedMode($object::class);
+        }
+        $this->attach();
+
+        $entry = $this->convert($object::class, $object, $mutable);
+
+        /** @var T */
+        return $this->storeUnder(self::instanceKey($entry->root()), $entry);
+    }
+
+    /**
+     * Drops an instance graph, by the shared instance persistInstance() returned or by its address
+     *
+     * The address form exists for the frozen store's alias discipline: drop() refuses to free
+     * a graph the request can still reach, and the instance passed as an argument IS such a
+     * reference - so a frozen-mode caller takes {@see self::addressOfInstance()} first,
+     * releases every reference, and drops by the number. Arena-backed stores skip the alias
+     * predicate (see guardedCandidates()), so the instance form is fine there.
+     *
+     * Returns false for a graph this store does not share - dropping what is not there is
+     * not an error, exactly as with drop().
+     */
+    public function dropInstance(object|int $target): bool
+    {
+        $address = \is_int($target) ? $target : $this->addressOfInstance($target);
+
+        return $address !== null && $this->drop(self::instanceKey($address));
+    }
+
+    /**
+     * Converts a graph into persistent memory and stamps its role, without registering it
+     *
+     * @param string $label What to blame in a mode-conflict message: the entry name for
+     *                      persist(), the class name for persistInstance()
+     */
+    private function convert(string $label, object $object, bool $mutable): PersistedEntry
+    {
         $entry = $this->persister->persistObject(
             $object,
             fn (int $address): ?PersistedObject => $this->registry->findObject($address),
@@ -377,39 +462,46 @@ final class PersistentStore
         foreach ($entry->members as $address) {
             $existing = $this->registry->findObject($address);
             if ($existing !== null && $existing->mutable !== $mutable) {
-                throw SharedMutationException::modeConflict($className, $existing->className, $mutable);
+                throw SharedMutationException::modeConflict($label, $existing->className, $mutable);
             }
         }
         foreach ($entry->created as $created) {
             $created->mutable = $mutable;
         }
 
+        return $entry;
+    }
+
+    /**
+     * Registers a converted graph under its name, upserting whatever lived there before
+     */
+    private function storeUnder(string $name, PersistedEntry $entry): object
+    {
         // Hydrated BEFORE the upsert overwrites the record, and released AFTER the new
         // members were share-incremented: an object belonging to both generations must
         // never transit through a share count of zero. Members the new graph keeps
         // referencing are protected, so only the truly superseded ones are candidates
-        $previous   = $this->registry->findEntry($className);
+        $previous   = $this->registry->findEntry($name);
         $candidates = [];
         if ($previous !== null) {
-            $candidates = $this->guardedCandidates($className, $previous, $entry->members);
+            $candidates = $this->guardedCandidates($name, $previous, $entry->members);
         }
 
-        $this->registry->store($className, $entry);
+        $this->registry->store($name, $entry);
 
         if ($previous !== null) {
             // The name already points at the new record - only the superseded generation
             // has to be released, never the key itself
-            $this->releaseEntry($className, $previous, $candidates, false);
+            $this->releaseEntry($name, $previous, $candidates, false);
         }
 
-        /** @var T */
-        return $this->materialize($className, $entry);
+        return $this->materialize($name, $entry);
     }
 
     /**
      * Removes a persisted graph and reclaims every object no other entry still references
      *
-     * Returns false when nothing is stored under $className - dropping what is not there
+     * Returns false when nothing is stored under $name - dropping what is not there
      * is not an error. Objects shared with other entries survive with their share count
      * decremented; only members that no entry references anymore are freed (their sealed
      * arrays, snapshot buffers, clone blocks and metadata tables all go back to the
@@ -426,23 +518,23 @@ final class PersistentStore
      * entry's arrays must not be used after drop() returns; across requests the question
      * cannot arise, since request memory dies with its request.
      *
-     * @param class-string $className Storage key of the graph to remove
+     * @param string $name Storage key of the graph to remove
      *
      * @return bool Whether an entry was actually removed
      */
-    public function drop(string $className): bool
+    public function drop(string $name): bool
     {
         // Attach first so handle state is consistent no matter when drop() is called
         $this->attach();
 
-        $entry = $this->registry->findEntry($className);
+        $entry = $this->registry->findEntry($name);
         if ($entry === null) {
             return false;
         }
 
-        $candidates = $this->guardedCandidates($className, $entry, []);
+        $candidates = $this->guardedCandidates($name, $entry, []);
 
-        $this->releaseEntry($className, $entry, $candidates, true);
+        $this->releaseEntry($name, $entry, $candidates, true);
 
         return true;
     }
@@ -450,7 +542,7 @@ final class PersistentStore
     /**
      * Re-registers every persisted object for the current request
      *
-     * @return array<class-string, object> class-string key => canonical graph root
+     * @return array<string, object> entry name => canonical graph root
      */
     public function attach(): array
     {
@@ -464,8 +556,8 @@ final class PersistentStore
                 $this->register($address, $object->object);
             }
 
-            foreach ($this->registry->allEntries() as $className => $entry) {
-                $this->instances[$className] = self::instanceOf($this->rootObjectOf($entry));
+            foreach ($this->registry->allEntries() as $name => $entry) {
+                $this->instances[$name] = self::instanceOf($this->rootObjectOf($entry));
             }
 
             $this->armShutdown();
@@ -475,20 +567,19 @@ final class PersistentStore
     }
 
     /**
+     * The graph root stored under $name, or null - `::class` names keep their inference
+     *
      * @template T of object
      *
-     * @param class-string<T> $className
+     * @param class-string<T>|string $name
      *
-     * @return T|null
+     * @return ($name is class-string<T> ? T|null : object|null)
      */
-    public function get(string $className): ?object
+    public function get(string $name): ?object
     {
         $this->attach();
 
-        $instance = $this->instances[$className] ?? null;
-        \assert($instance === null || $instance instanceof $className);
-
-        return $instance;
+        return $this->instances[$name] ?? null;
     }
 
     /**
@@ -503,11 +594,11 @@ final class PersistentStore
      * and hand out identical handle numbers, so handles collide by construction. The address
      * is the only stable identity across processes.
      *
-     * @param class-string $className
+     * @param string $name
      */
-    public function addressOf(string $className): ?int
+    public function addressOf(string $name): ?int
     {
-        $entry = $this->registry->findEntry($className);
+        $entry = $this->registry->findEntry($name);
 
         return $entry?->root();
     }
@@ -535,6 +626,17 @@ final class PersistentStore
         }
 
         return $this->registry->findObject($address) !== null ? $address : null;
+    }
+
+    /**
+     * The entry name persistInstance() mints for a graph rooted at $address
+     *
+     * Deterministic on purpose: any process of the family can reconstruct it from the
+     * address alone, which is all dropInstance() needs and all a sibling ever holds.
+     */
+    private static function instanceKey(int $address): string
+    {
+        return sprintf('%s%x', self::INSTANCE_PREFIX, $address);
     }
 
     /**
@@ -755,11 +857,11 @@ final class PersistentStore
     }
 
     /**
-     * @param class-string $className
+     * @param string $name
      */
-    public function has(string $className): bool
+    public function has(string $name): bool
     {
-        return $this->registry->has($className);
+        return $this->registry->has($name);
     }
 
     /**
@@ -858,10 +960,10 @@ final class PersistentStore
      *
      * @return list<PersistedObject> Members that releasing this entry would reclaim
      */
-    private function guardedCandidates(string $className, PersistedEntry $entry, array $protected): array
+    private function guardedCandidates(string $name, PersistedEntry $entry, array $protected): array
     {
-        $hadInstance = isset($this->instances[$className]);
-        unset($this->instances[$className]);
+        $hadInstance = isset($this->instances[$name]);
+        unset($this->instances[$name]);
 
         // A member whose last referencing entry is this one, and which no successor keeps
         $candidates = [];
@@ -889,14 +991,14 @@ final class PersistentStore
                 continue;
             }
             if ($hadInstance) {
-                $this->instances[$className] = self::instanceOf($this->rootObjectOf($entry));
+                $this->instances[$name] = self::instanceOf($this->rootObjectOf($entry));
             }
 
             throw new \RuntimeException(sprintf(
                 'Cannot release %s: the request still holds a reference to the persisted %s instance ' .
                 'that would be freed. Release every variable, property and array element pointing at ' .
                 'the graph (unset() them, or let their scope end) before dropping or replacing the entry.',
-                $className,
+                $name,
                 $candidate->className,
             ));
         }
@@ -914,7 +1016,7 @@ final class PersistentStore
      * @param bool                  $unlink     Whether the NAME still points at this entry
      *                                          (false for the superseded half of an upsert)
      */
-    private function releaseEntry(string $className, PersistedEntry $entry, array $candidates, bool $unlink): void
+    private function releaseEntry(string $name, PersistedEntry $entry, array $candidates, bool $unlink): void
     {
         // A bucket pointing at a freed clone would be walked at request shutdown
         foreach ($candidates as $candidate) {
@@ -922,7 +1024,7 @@ final class PersistentStore
         }
 
         if ($unlink) {
-            $this->registry->removeEntry($className, $entry);
+            $this->registry->removeEntry($name, $entry);
         } else {
             $this->registry->discardEntry($entry);
         }
