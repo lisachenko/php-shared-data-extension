@@ -18,8 +18,8 @@ use PHPUnit\Framework\TestCase;
 
 /**
  * The persistent module and registry survive for the whole test process (that is the
- * feature): persist() is an upsert per class-string key, so every test re-persists its
- * own fresh state and detaches what it attached.
+ * feature): persist() is an upsert per name, so every test re-persists its own fresh
+ * state and detaches what it attached.
  */
 class PersistentStoreTest extends TestCase
 {
@@ -185,11 +185,86 @@ class PersistentStoreTest extends TestCase
         $this->store->persist(\ArrayObject::class, new \ArrayObject([1, 2, 3]));
     }
 
-    public function testKeyMustNameAClassOfTheInstance(): void
+    public function testAGraphMayBePersistedUnderAPlainName(): void
+    {
+        $persisted = $this->store->persist('primary-config', $this->makeConfig());
+
+        self::assertSame($persisted, $this->store->get('primary-config'));
+        self::assertTrue($this->store->has('primary-config'));
+
+        unset($persisted);
+        $this->store->drop('primary-config');
+    }
+
+    public function testTwoInstancesOfOneClassLiveUnderTwoNames(): void
+    {
+        $first  = $this->makeConfig();
+        $second = $this->makeConfig();
+
+        $second->label = 'secondary';
+
+        $left  = $this->store->persist('config-left', $first);
+        $right = $this->store->persist('config-right', $second);
+
+        self::assertNotSame($left, $right);
+        self::assertSame('primary', $left->label);
+        self::assertSame('secondary', $right->label);
+
+        unset($left, $right);
+        $this->store->drop('config-left');
+        $this->store->drop('config-right');
+    }
+
+    public function testTwoInstanceGraphsOfOneClassAreBothLive(): void
+    {
+        $baseline = $this->store->objectCount();
+
+        $first  = $this->makeConfig();
+        $second = $this->makeConfig();
+
+        $second->label = 'secondary';
+
+        $left  = $this->store->persistInstance($first);
+        $right = $this->store->persistInstance($second);
+
+        self::assertNotSame($left, $right);
+        self::assertSame('primary', $left->label);
+        self::assertSame('secondary', $right->label);
+        self::assertSame($baseline + 2, $this->store->objectCount());
+
+        // The frozen store's alias discipline: release the instances, then drop by address.
+        $leftAddress  = $this->store->addressOfInstance($left);
+        $rightAddress = $this->store->addressOfInstance($right);
+        self::assertNotNull($leftAddress);
+        self::assertNotNull($rightAddress);
+        unset($left, $right);
+
+        self::assertTrue($this->store->dropInstance($leftAddress));
+        self::assertTrue($this->store->dropInstance($rightAddress));
+        self::assertSame($baseline, $this->store->objectCount());
+    }
+
+    public function testPersistingASharedInstanceAgainIsIdempotent(): void
+    {
+        $first = $this->store->persistInstance($this->makeConfig());
+        $again = $this->store->persistInstance($first);
+
+        self::assertSame($first, $again);
+
+        // One drop suffices: the re-persist resolved to the same entry instead of minting one.
+        $address = $this->store->addressOfInstance($first);
+        self::assertNotNull($address);
+        unset($first, $again);
+
+        self::assertTrue($this->store->dropInstance($address));
+        self::assertFalse($this->store->dropInstance($address));
+    }
+
+    public function testTheInstanceNamePrefixIsReserved(): void
     {
         $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessageMatches('/must name a class or interface/');
-        $this->store->persist(\DateTimeInterface::class, $this->makeConfig());
+        $this->expectExceptionMessageMatches('/reserved for instance graphs/');
+        $this->store->persist('@f00', $this->makeConfig());
     }
 
     public function testDynamicPropertyIsRejected(): void

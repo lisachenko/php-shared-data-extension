@@ -452,11 +452,15 @@ store's own shutdown function.
 
 ```php
 $store = PersistentStore::boot();          // register/reattach the persistent module
-$store->persist(User::class, $o): User;    // convert + return canonical instance (T of class-string<T>)
-$store->attach(): array;                   // class-string => instance for this request (idempotent)
+$store->persist(User::class, $o): User;    // convert + return canonical instance; the key is a NAME,
+                                           // ::class by convention so get() keeps its inference
+$store->persistInstance($o): User;         // per-instance graph named by its own root address:
+                                           // any number of one class live at once, none upserts another
+$store->attach(): array;                   // name => instance for this request (idempotent)
 $store->get(User::class): ?User;           // canonical instance or null
 $store->has(User::class): bool;
 $store->drop(User::class): bool;           // remove the entry + reclaim what nobody shares
+$store->dropInstance($o /* or address */): bool; // same, for an instance graph
 $store->objectCount(): int;                // live persistent clones (shared ones counted once)
 $store->detach(): void;                    // runs automatically at request shutdown
 
