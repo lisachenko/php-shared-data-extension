@@ -32,6 +32,34 @@ class ArenaTest extends TestCase
         return Arena::create($size ?? self::TEST_SIZE);
     }
 
+    /** Resident bytes of the mapping holding $address, straight out of /proc/self/smaps */
+    private function mappingRss(int $address): int
+    {
+        $handle  = fopen('/proc/self/smaps', 'r');
+        $inRange = false;
+
+        if ($handle === false) {
+            return 0;
+        }
+
+        try {
+            while (($line = fgets($handle)) !== false) {
+                if (preg_match('/^([0-9a-f]+)-([0-9a-f]+) /', $line, $bounds) === 1) {
+                    $inRange = hexdec($bounds[1]) <= $address && $address < hexdec($bounds[2]);
+
+                    continue;
+                }
+                if ($inRange && str_starts_with($line, 'Rss:')) {
+                    return ((int) filter_var($line, FILTER_SANITIZE_NUMBER_INT)) * 1024;
+                }
+            }
+        } finally {
+            fclose($handle);
+        }
+
+        return 0;
+    }
+
     public function testFreshArenaStartsEmptyAboveItsHeader(): void
     {
         $arena = $this->makeArena();
@@ -130,6 +158,47 @@ class ArenaTest extends TestCase
 
         $this->assertSame(11, $arena->writeBytes($address + 8, 'hello arena'));
         $this->assertSame('hello arena', $arena->readBytes($address + 8, 11));
+    }
+
+    public function testPrefaultTouchesOnlyItsOwnBlock(): void
+    {
+        $arena = $this->makeArena();
+
+        // The neighbour comes first, so its tail shares a page with the head of the block being
+        // prefaulted: a loop that started at the page boundary instead of at the block would
+        // overwrite it, and nothing else in the arena would ever notice
+        $neighbour = $arena->allocate(64);
+        $arena->writeWord($neighbour, 0x5A5A5A5A5A);
+
+        $block = $arena->allocate(3 * 4096 + 24, 8);
+        $arena->prefault($block, 3 * 4096 + 24);
+
+        $this->assertSame(0x5A5A5A5A5A, $arena->readWord($neighbour));
+
+        // A bumped block is fresh mapping, so prefault stores a zero over a zero and the block
+        // reads exactly as it did before
+        foreach ([0, 4096, 8192, 3 * 4096 + 16] as $offset) {
+            $this->assertSame(0, $arena->readWord($block + $offset));
+        }
+    }
+
+    public function testPrefaultMakesTheBlockResidentUpFront(): void
+    {
+        if (!is_readable('/proc/self/smaps')) {
+            $this->markTestSkipped('residency is read from /proc/self/smaps, which is not available here');
+        }
+
+        $arena = $this->makeArena(2 << 20);
+        $block = $arena->allocate(1 << 20, 4096);
+
+        $before = $this->mappingRss($arena->baseAddress());
+        $arena->prefault($block, 1 << 20);
+        $after = $this->mappingRss($arena->baseAddress());
+
+        // The point of the call: pages that would otherwise arrive one fault at a time, for as
+        // long as the structure is being filled, are all here now. Half the block is a generous
+        // floor - the kernel may have faulted some of it in already
+        $this->assertGreaterThan($before + (512 << 10), $after);
     }
 
     public function testAccessOutsideThePayloadIsRefused(): void

@@ -110,6 +110,15 @@ shared struct before it aborts* — siblings then read plausible garbage with no
   child calling it is a deliberate no-op. Do not re-arm it.
 - Every rewrite of a shared string costs a new arena block (a reader may be following the old
   pointer right now). Exhaustion is a typed `ArenaException`, never a crash.
+- **A pre-sized table that is consumed gradually is `prefault()`ed at creation.** The mapping is
+  anonymous, so its pages arrive on first write. A structure handing out one record at a time —
+  `ResultSlotTable` is the case — therefore charges its memory a page at a time for the whole life
+  of the run, while the watermark, the allocator counter and every arena metric stay flat, because
+  nothing is being allocated. The only visible symptom is the family's RSS climbing with the
+  workload, which is indistinguishable from a leak and was reported as one
+  (native-php-coroutines#24). Touch the block once, in the creating process, before the fork: it
+  does not add memory, it decides when the memory is charged, and afterwards a climb really is
+  a climb.
 - Gate memory claims with the soaks, and watch the **watermark plateau** rather than the peak:
 
   ```bash
