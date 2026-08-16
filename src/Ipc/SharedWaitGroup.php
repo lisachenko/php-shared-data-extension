@@ -25,7 +25,7 @@ use Lisachenko\SharedData\Shm\Arena;
  *
  * ```text
  *   header (4 words)   counter | mutex address | waiter capacity | waiters parked
- *   waiters            waiter capacity words - wake slots parked on zero
+ *   waiters            waiter capacity words - a {@see WaiterTable}, zero meaning free
  * ```
  *
  * A negative counter is a hard error rather than a clamp: done() called more often than
