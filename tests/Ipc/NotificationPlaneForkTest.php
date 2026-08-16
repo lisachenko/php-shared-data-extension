@@ -133,8 +133,13 @@ class NotificationPlaneForkTest extends IpcTestCase
 
         SerializationGuard::reset();
 
-        $child = $this->fork(static function () use ($channel, $slots): int {
-            $slotId = 0;
+        // Allocated before the fork, so the child inherits the TICKET rather than guessing an
+        // index: a slot id carries its generation, and generation 0 is deliberately no slot at all
+        $slotId = $slots->allocateSlot();
+        $this->assertSame(0, SlotTicket::indexOf($slotId));
+        $this->assertSame(1, SlotTicket::generationOf($slotId));
+
+        $child = $this->fork(static function () use ($channel, $slots, $slotId): int {
             for ($index = 0; $index < 4; $index++) {
                 [$value, $ok] = $channel->recv(10.0);
                 if (!$ok) {
@@ -147,9 +152,6 @@ class NotificationPlaneForkTest extends IpcTestCase
 
             return self::OK;
         });
-
-        $slotId = $slots->allocateSlot();
-        $this->assertSame(0, $slotId);
 
         $array[0] = 'inside the shared array';
         $channel->send('a string of real bytes', 10.0);

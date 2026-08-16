@@ -265,8 +265,13 @@ sentence.
   cross-process rendezvous; `close()` crosses processes;
 - `SharedArray` — fixed-capacity vector of records, per-instance stripe: the container a
   `zend_array` cannot be (§4);
-- `ResultSlotTable` — futures. A slot settles exactly once, carrying either a value record or
-  a `SharedError` (a persisted three-string object; a `Throwable` can never be shared);
+- `ResultSlotTable` — futures. A slot settles exactly once **per generation**, carrying either
+  a value record or a `SharedError` (a persisted three-string object; a `Throwable` can never be
+  shared). Slots are **recycled in place** through a free list threaded through the slot records
+  — nothing is freed, because nothing here ever can be (§6) — and a slot id is a `SlotTicket`,
+  index and generation packed into the 32 bits a wake event has for it. Every verb checks the
+  generation, so a handle outliving its release is refused by name instead of being handed the
+  next task's answer;
 - `SharedMutex` / `AtomicInt` / `SharedWaitGroup` — robust locking, an aligned word with
   stripe-locked read-modify-write (FFI has no CAS), and a counter with waiters;
 - `ClosureProvenance` — the register of closures the family may invoke by address. It stores

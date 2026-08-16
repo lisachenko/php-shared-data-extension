@@ -110,6 +110,12 @@ shared struct before it aborts* — siblings then read plausible garbage with no
   child calling it is a deliberate no-op. Do not re-arm it.
 - Every rewrite of a shared string costs a new arena block (a reader may be following the old
   pointer right now). Exhaustion is a typed `ArenaException`, never a crash.
+- **Recycling is in-place reuse, never a free.** A fixed-record table may hand a record back out
+  — `Ipc\ResultSlotTable` does, through a free list threaded through the slot records themselves
+  — but the block stays where it is and nothing is unmapped, so the rule above is untouched. A
+  recycled record needs an **identity that changes with it**: without the generation in
+  `Ipc\SlotTicket`, an id held one moment too long addresses the next occupant and is answered
+  with its data. Every verb re-checks that generation; a mismatch is a typed refusal naming both.
 - Gate memory claims with the soaks, and watch the **watermark plateau** rather than the peak:
 
   ```bash
@@ -127,8 +133,11 @@ that refusal is the feature; never soften it into a migration.
 Keep the **version history table in `Registry`'s docblock current**: one line per version,
 saying what changed and why a reader of the older layout would be wrong. A consumer structure
 that merely lives in the arena payload and adds no field to a registry record does **not** bump
-the version (`Ipc\SharedChannel`, `Ipc\SharedArray`, `Ipc\ClosureProvenance`); it publishes
-itself in the roots directory instead.
+the version (`Ipc\SharedChannel`, `Ipc\SharedArray`, `Ipc\ClosureProvenance`,
+`Ipc\ResultSlotTable`); it publishes itself in the roots directory instead. Such a structure
+carries its **own** guard when its record shape changes — `ResultSlotTable::FORMAT` is one, a
+header word checked at `attach()` — because "does not bump `LAYOUT_VERSION`" must not mean
+"changes shape with nothing refusing a reader of the old one".
 
 ## 8. Frozen-mode invariants that must survive every change
 
