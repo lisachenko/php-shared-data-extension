@@ -162,8 +162,19 @@ final class ResultSlotTable
             throw IpcException::capacityTooLarge('Result slot table', $capacity, SlotTicket::MAX_SLOTS);
         }
         $arena   = $allocator->arena();
-        $address = $arena->allocate((self::HEADER_WORDS + $capacity * self::SLOT_WORDS) * 8, 64);
+        $size    = (self::HEADER_WORDS + $capacity * self::SLOT_WORDS) * 8;
+        $address = $arena->allocate($size, 64);
         $mutex   = $arena->allocateMutex();
+
+        // Pre-sized means pre-sized. Slots are handed out one record at a time for the whole life
+        // of the run, so without this the table's pages fault in a few dozen slots at a time and
+        // the family's RSS climbs with the workload while the arena watermark - correctly - never
+        // moves. That is indistinguishable from a leak to any memory gate, and it was reported as
+        // one (native-php-coroutines#24). Creation happens before the fork, so the cost is paid
+        // once. Recycling does not replace this: a steady workload reuses a handful of records and
+        // would look flat by accident, while one whose concurrency really grows still reaches
+        // records nothing has touched.
+        $arena->prefault($address, $size);
 
         $arena->writeWord($address + self::WORD_CAPACITY * 8, $capacity);
         $arena->writeWord($address + self::WORD_MUTEX * 8, $mutex);
