@@ -44,26 +44,115 @@ final class IpcException extends \RuntimeException
         );
     }
 
-    public static function slotTableFull(int $capacity): self
+    public static function slotTableFull(int $capacity, int $outstanding, int $retired): self
     {
         return new self(sprintf(
-            'All %d result slots are used. The slot table is pre-sized in the arena and never grows; ' .
-            'create it with a larger capacity before the workers fork.',
+            'All %d result slots are in use (%d outstanding, %d retired). Slots are recycled through ' .
+            'a free list, so a slot only comes back when its owner calls releaseSlot() - a handle ' .
+            'that is never awaited never gives its slot back. Either release what is settled, or ' .
+            'pre-size the table larger before the workers fork; it is allocated in the arena and ' .
+            'never grows.',
             $capacity,
+            $outstanding,
+            $retired,
         ));
     }
 
-    public static function unknownSlot(int $id, int $capacity): self
-    {
-        return new self(sprintf('Result slot %d does not exist; the table holds slots 0..%d', $id, $capacity - 1));
-    }
-
-    public static function slotAlreadyCompleted(int $id): self
+    public static function unknownSlot(int $index, int $capacity): self
     {
         return new self(sprintf(
-            'Result slot %d is already completed. A slot is written exactly once - allocate a new one ' .
-            'for the next result rather than reusing a settled slot.',
-            $id,
+            'Result slot %d does not exist; the table holds slots 0..%d',
+            $index,
+            $capacity - 1,
+        ));
+    }
+
+    /**
+     * A handle that names a slot the table has already handed to somebody else
+     *
+     * This is the whole safety property of recycling: a slot id is only half a claim, and the
+     * generation is the other half. Answering such a handle with the slot's current contents
+     * would hand one task's result to another task's waiter, silently and plausibly.
+     */
+    public static function staleSlot(int $index, int $held, int $current): self
+    {
+        return new self(sprintf(
+            'Result slot %d is at generation %d and this handle holds generation %d: the slot was ' .
+            'released and handed to another task. A recycled slot never answers an older handle - ' .
+            'read the result before releasing it, and do not keep the id afterwards.',
+            $index,
+            $current,
+            $held,
+        ));
+    }
+
+    /**
+     * A slot that has been used up: its generation counter reached the end of the ticket layout
+     */
+    public static function slotRetired(int $index): self
+    {
+        return new self(sprintf(
+            'Result slot %d is retired: its generation counter reached the end of the 16 bits a slot ' .
+            'ticket carries, so the slot was taken out of circulation instead of wrapping round to a ' .
+            'generation an old handle could match.',
+            $index,
+        ));
+    }
+
+    public static function slotAlreadyCompleted(int $index, int $generation): self
+    {
+        return new self(sprintf(
+            'Result slot %d is already completed in generation %d. A slot is written exactly once per ' .
+            'generation - allocate a new one for the next result rather than reusing a settled slot.',
+            $index,
+            $generation,
+        ));
+    }
+
+    /**
+     * A release of a slot whose answer has not been written yet
+     *
+     * Recycling a pending slot would hand a live record to the next task while the process that
+     * owes the answer is still going to write it - the one way this design could return another
+     * task's result. Refusing is the only correct answer.
+     */
+    public static function slotNotSettled(int $index): self
+    {
+        return new self(sprintf(
+            'Result slot %d is still pending and cannot be released: the process that owes its answer ' .
+            'may still write it, and recycling the slot now would let that write land on another ' .
+            'task. Release a slot only once it has settled and its result has been read.',
+            $index,
+        ));
+    }
+
+    public static function capacityTooLarge(string $structure, int $capacity, int $maximum): self
+    {
+        return new self(sprintf(
+            '%s capacity is %d, above the %d a slot ticket can address: an id carries the slot index ' .
+            'and its generation in the 32 bits a wake event has for it, and a wider table would ' .
+            'truncate ids rather than fail',
+            $structure,
+            $capacity,
+            $maximum,
+        ));
+    }
+
+    /**
+     * A table in the arena whose record shape is not the one this build reads
+     *
+     * `ResultSlotTable` is a consumer structure published in the roots directory, so it does not
+     * ride `Registry::LAYOUT_VERSION`; this word is its own guard, and it exists because reading
+     * the wrong slot geometry at the right address is silent rather than fatal.
+     */
+    public static function slotTableFormat(int $found, int $expected): self
+    {
+        return new self(sprintf(
+            'The result slot table in the arena is format %d and this build reads format %d. Slots ' .
+            'are addressed by offset, so a mismatched shape is read at the right address with the ' .
+            'wrong meaning - the whole family has to run one build of this package.',
+            $found,
+            $expected,
         ));
     }
 
