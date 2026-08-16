@@ -263,6 +263,23 @@ sentence.
   dedicated mutex (a structure locked on every operation does not belong on a shared stripe).
   Head and tail are monotonic counters, so fill level is a subtraction; capacity 0 is a true
   cross-process rendezvous; `close()` crosses processes;
+  - a rendezvous accepts a value only while a receiver is waiting, and a consumer with its own
+    scheduler is never inside `recv()` — so `registerReceiver()`/`cancelReceiver()` (and their
+    sender mirrors) let a receiver parked in someone else's event loop count as the partner.
+    The registration is a claim about **presence, never about storage**: the record still goes
+    into the single ring slot a capacity-0 channel allocates, so a cancellation can always
+    succeed — it never has a value in its hands — and a record deposited against a
+    registration that is withdrawn a moment later simply waits in the ring for the next
+    receiver while its sender stays parked. The whole handshake (register, re-check, deposit,
+    cancel) happens under the channel's own mutex, so the happens-before edge is the same
+    release/acquire pair it always was;
+  - a registration outlives the call that made it, and can therefore outlive its process. Each
+    waiter entry packs `owner pid << 32 | wake slot + 1` into one aligned word (two words would
+    be a 16-byte record, and those tear — §5), and a rendezvous deposit reaps the entries whose
+    owner is gone before it reads the gate, so a dead worker cannot go on standing in for a
+    partner. Liveness is `posix_kill(pid, 0)` **plus** the wake registry still naming that pid
+    as the slot's owner, because a dead owner's slot is recycled to the next process that
+    claims one;
 - `SharedArray` — fixed-capacity vector of records, per-instance stripe: the container a
   `zend_array` cannot be (§4);
 - `ResultSlotTable` — futures. A slot settles exactly once **per generation**, carrying either

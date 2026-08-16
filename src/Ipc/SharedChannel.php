@@ -56,6 +56,34 @@ use Lisachenko\SharedData\Shm\ArenaAllocator;
  * the other half of the API: trySend()/tryRecv() plus notificationStream(), so it can park a
  * Fiber in its own event loop and never block the process. Both halves observe the same
  * waiter tables, so a Fiber-parked consumer and a spin-blocked one wake identically.
+ *
+ * ## Rendezvous with a receiver that is parked somewhere else
+ *
+ * The gate on a capacity-0 handoff is "is a receiver waiting", and until registerReceiver()
+ * existed the only way to be one was to be inside recv() - which a scheduler-driven consumer
+ * never calls, because its whole invariant is that a worker blocks in exactly one place. That
+ * made a rendezvous unusable from a coroutine runtime rather than merely inconvenient, so the
+ * registration is now a named operation of its own:
+ *
+ * ```php
+ * $token = $channel->registerReceiver();          // null => a record is already there
+ * // ... park the Fiber on notificationStream() in the consumer's own event loop ...
+ * $channel->cancelReceiver($token);               // on unpark, whatever woke it
+ * ```
+ *
+ * A registration is a claim about presence, never about storage: the handed-off record still
+ * goes into the one ring slot a capacity-0 channel allocates (`max($capacity, 1)`), so there
+ * is no per-registration cell to keep consistent and no way for a value to belong to a waiter
+ * that walked away. That is what makes cancellation total - cancelReceiver() can always
+ * succeed, because it never has a value in its hands. A record deposited against a
+ * registration that is cancelled a moment later simply stays in the ring for the next
+ * receiver, and the sender stays parked until somebody actually takes it, which is exactly
+ * the state it would have been in had it never deposited at all.
+ *
+ * Registrations outlive the call that made them, so unlike a waiter parked inside recv() they
+ * can outlive their process. Each entry records its owner pid; a rendezvous deposit reaps the
+ * ones whose owner is gone before it reads the gate (see reapDeadWaiters()), so a dead
+ * worker's registration cannot go on telling senders that a partner is present.
  */
 final class SharedChannel
 {
@@ -220,6 +248,26 @@ final class SharedChannel
     }
 
     /**
+     * Receivers currently waiting on this channel, parked inside recv() or registered
+     *
+     * On a rendezvous channel this is the gate a handoff passes: a non-zero count is what
+     * makes trySend() accept a value. It is a hint for everybody else - by the time a caller
+     * reads it, a waiter may have taken a record or cancelled.
+     */
+    public function parkedReceivers(): int
+    {
+        return $this->word(self::WORD_RECEIVERS_PARKED);
+    }
+
+    /**
+     * Senders currently waiting on this channel, parked inside send() or registered
+     */
+    public function parkedSenders(): int
+    {
+        return $this->word(self::WORD_SENDERS_PARKED);
+    }
+
+    /**
      * The descriptor a scheduler parks on; drain it and re-poll tryRecv()/trySend()
      *
      * @return resource
@@ -240,21 +288,49 @@ final class SharedChannel
     /**
      * Sends without ever blocking; false means "no room right now"
      *
-     * On a rendezvous channel this succeeds only while a receiver is already parked, and it
-     * returns as soon as the record is deposited - the synchronous half of the handshake
-     * (waiting until the value is actually taken) is what send() adds on top.
+     * On a rendezvous channel this succeeds only while a receiver is waiting - one parked
+     * inside recv() or one that announced itself with registerReceiver() - and it returns as
+     * soon as the record is deposited. The synchronous half of the handshake (waiting until
+     * the value is actually taken) is what send() adds on top, and what a consumer with its
+     * own scheduler builds out of trySendTicket() and isTicketTaken().
      */
     public function trySend(mixed $value): bool
+    {
+        return $this->trySendTicket($value) !== null;
+    }
+
+    /**
+     * trySend(), returning the ticket the record was deposited at instead of a flag
+     *
+     * The ticket is the monotonic position in the ring, and `head > ticket` is the whole
+     * definition of "this record has been taken" - see isTicketTaken(). A consumer that parks
+     * its own waiters needs exactly that: trySend() alone cannot express a rendezvous, because
+     * the deposit and the take are two events and only the second one completes the handshake.
+     *
+     * @return int|null Ticket of the deposited record, or null when it could not be deposited
+     */
+    public function trySendTicket(mixed $value): ?int
     {
         [$tag, $payload] = $this->codec->encode($value);
 
         $ticket = $this->offer($tag, $payload, requireParkedReceiver: $this->isRendezvous());
         if ($ticket === null) {
-            return false;
+            return null;
         }
         $this->wakeReceivers($tag, $payload);
 
-        return true;
+        return $ticket;
+    }
+
+    /**
+     * Whether the record deposited at $ticket has been taken by a receiver
+     *
+     * A single aligned word read of a monotonic counter, so no lock: head only ever grows, and
+     * an 8-byte load never tears (EPIC #15, correction #2).
+     */
+    public function isTicketTaken(int $ticket): bool
+    {
+        return $this->word(self::WORD_HEAD) > $ticket;
     }
 
     /**
@@ -366,6 +442,174 @@ final class SharedChannel
     }
 
     /**
+     * Announces a receiver that is parked somewhere other than inside recv()
+     *
+     * This is the half of the rendezvous handshake a consumer with its own scheduler could not
+     * express before: it makes the channel count this process as a waiting receiver, so a
+     * sibling's trySend() on a capacity-0 channel has a partner to hand its value to, while
+     * the Fiber that will take the value sits in the consumer's own event loop on
+     * notificationStream().
+     *
+     * The registration and the readiness re-check happen in ONE critical section, which is the
+     * only thing that makes the wakeup safe: a sender that deposits after this point
+     * necessarily sees this entry, and a record that arrived before it is reported here rather
+     * than waited for. A caller that gets null must NOT park - it retries tryRecv() at once.
+     *
+     * @return int|null Token for cancelReceiver(), or null when a record (or a close) is
+     *                  already there and nothing was registered
+     *
+     * @throws IpcException When every entry of the receivers table is taken
+     */
+    public function registerReceiver(): ?int
+    {
+        // Claimed before the lock: slot() may take the wake registry's own mutex, and two
+        // arena locks held at once is a lock order nobody else in this package obeys
+        $wakeSlot = $this->wake->slot();
+        $owner    = (int) getmypid();
+
+        $recovered = $this->arena->lockMutexAt($this->mutex);
+
+        $ready = $this->word(self::WORD_TAIL) > $this->word(self::WORD_HEAD)
+            || $this->word(self::WORD_CLOSED) !== 0;
+        $entry = null;
+        if (!$ready) {
+            $entry = $this->receivers->register($wakeSlot, $owner);
+            if ($entry !== null) {
+                $this->setWord(self::WORD_RECEIVERS_PARKED, $this->word(self::WORD_RECEIVERS_PARKED) + 1);
+            }
+        }
+
+        $this->arena->unlockMutexAt($this->mutex);
+
+        $this->recoveredLock = $this->recoveredLock || $recovered;
+
+        if ($ready) {
+            return null;
+        }
+        if ($entry === null) {
+            throw IpcException::waiterTableFull('receivers', $this->waiterCapacity);
+        }
+
+        // On a rendezvous channel the registration IS the state change a sender is waiting
+        // for - there is no room to free and no record to publish - so it has to be announced
+        // like any other, after the lock is gone and never while holding it
+        if ($this->isRendezvous()) {
+            $this->wakeSenders();
+        }
+
+        return $entry;
+    }
+
+    /**
+     * Withdraws a registerReceiver() registration
+     *
+     * Always succeeds and never hands anything back, because a registration never owned a
+     * value: a record deposited against it is in the ring, where the next receiver takes it
+     * and the sender goes on waiting until one does. That is what lets a select loser or a
+     * cancelled context unwind without having to deliver a value it can no longer deliver.
+     */
+    public function cancelReceiver(int $token): void
+    {
+        $this->unpark($this->receivers, $token, self::WORD_RECEIVERS_PARKED);
+    }
+
+    /**
+     * Announces a sender that is parked somewhere other than inside send()
+     *
+     * The mirror of registerReceiver(), and the same one-critical-section rule: what "ready"
+     * means depends on what the sender is waiting for.
+     *
+     * @param int|null $ticket Ticket of a record this sender already deposited and is waiting
+     *                         to see taken (the second half of a rendezvous send); null when
+     *                         it is waiting for somewhere to put a value in the first place
+     *
+     * @return int|null Token for cancelSender(), or null when the sender can already proceed
+     *                  and nothing was registered
+     *
+     * @throws IpcException When every entry of the senders table is taken
+     */
+    public function registerSender(?int $ticket = null): ?int
+    {
+        $wakeSlot = $this->wake->slot();
+        $owner    = (int) getmypid();
+        $limit    = max($this->capacity, 1);
+
+        $recovered = $this->arena->lockMutexAt($this->mutex);
+
+        $head  = $this->word(self::WORD_HEAD);
+        $ready = $this->word(self::WORD_CLOSED) !== 0;
+        if (!$ready) {
+            $ready = $ticket !== null
+                ? $head > $ticket
+                : $this->word(self::WORD_TAIL) - $head < $limit
+                    && (!$this->isRendezvous() || $this->word(self::WORD_RECEIVERS_PARKED) > 0);
+        }
+        $entry = null;
+        if (!$ready) {
+            $entry = $this->senders->register($wakeSlot, $owner);
+            if ($entry !== null) {
+                $this->setWord(self::WORD_SENDERS_PARKED, $this->word(self::WORD_SENDERS_PARKED) + 1);
+            }
+        }
+
+        $this->arena->unlockMutexAt($this->mutex);
+
+        $this->recoveredLock = $this->recoveredLock || $recovered;
+
+        if ($ready) {
+            return null;
+        }
+        if ($entry === null) {
+            throw IpcException::waiterTableFull('senders', $this->waiterCapacity);
+        }
+
+        return $entry;
+    }
+
+    /**
+     * Withdraws a registerSender() registration
+     */
+    public function cancelSender(int $token): void
+    {
+        $this->unpark($this->senders, $token, self::WORD_SENDERS_PARKED);
+    }
+
+    /**
+     * Releases registrations whose owning process is gone, and reports how many
+     *
+     * A waiter parked inside recv() or send() takes its entry back on the way out, so it can
+     * never go stale; a registration made from a consumer's event loop can, and on a
+     * rendezvous channel a stale one would keep telling senders that a partner is present. A
+     * deposit reaps before it reads the gate, so this is normally invisible - it is public for
+     * a supervisor that wants to reclaim a dead worker's entries on its own schedule, and for
+     * the tests that prove the reaping happens at all.
+     *
+     * Cheap it is not: the survey asks the operating system whether each owner still exists.
+     * It runs entirely OUTSIDE the lock, and only what it found is re-verified and released
+     * inside one.
+     */
+    public function reapDeadWaiters(): int
+    {
+        $deadReceivers = $this->surveyDead($this->receivers);
+        $deadSenders   = $this->surveyDead($this->senders);
+
+        if ($deadReceivers === [] && $deadSenders === []) {
+            return 0;
+        }
+
+        $recovered = $this->arena->lockMutexAt($this->mutex);
+
+        $reaped = $this->releaseSurveyed($this->receivers, $deadReceivers, self::WORD_RECEIVERS_PARKED)
+            + $this->releaseSurveyed($this->senders, $deadSenders, self::WORD_SENDERS_PARKED);
+
+        $this->arena->unlockMutexAt($this->mutex);
+
+        $this->recoveredLock = $this->recoveredLock || $recovered;
+
+        return $reaped;
+    }
+
+    /**
      * Writes one record into the ring if it fits, and returns the ticket it was written at
      *
      * @param bool $requireParkedReceiver Rendezvous handoff only: refuse to deposit while no
@@ -377,7 +621,18 @@ final class SharedChannel
     {
         $limit = max($this->capacity, 1);
 
+        // The gate below trusts the parked count, and a registration can outlive the process
+        // that made it - so on a handoff the entries whose owner is gone are surveyed here,
+        // outside the lock where the syscalls belong, and released inside the very critical
+        // section that then reads the count. Without that a dead worker's leftover entry would
+        // make every later send believe a partner is present
+        $dead = $requireParkedReceiver && $this->word(self::WORD_RECEIVERS_PARKED) > 0
+            ? $this->surveyDead($this->receivers)
+            : [];
+
         $recovered = $this->arena->lockMutexAt($this->mutex);
+
+        $this->releaseSurveyed($this->receivers, $dead, self::WORD_RECEIVERS_PARKED);
 
         $closed   = $this->word(self::WORD_CLOSED);
         $head     = $this->word(self::WORD_HEAD);
@@ -422,7 +677,13 @@ final class SharedChannel
             // Registered and re-checked in ONE critical section: a receiver that frees a slot
             // after this point necessarily sees this entry, so the wakeup cannot be lost
             $entry = $this->senders->register($wakeSlot);
-            $this->setWord(self::WORD_SENDERS_PARKED, $this->word(self::WORD_SENDERS_PARKED) + 1);
+            if ($entry !== null) {
+                // Counted only when an entry was actually taken: unpark() has nothing to give
+                // back for a full table, so counting a failed registration would leave the
+                // parked count permanently too high - and on a rendezvous channel that count
+                // is the gate a handoff passes
+                $this->setWord(self::WORD_SENDERS_PARKED, $this->word(self::WORD_SENDERS_PARKED) + 1);
+            }
         }
 
         $this->arena->unlockMutexAt($this->mutex);
@@ -453,7 +714,11 @@ final class SharedChannel
         $entry = null;
         if (!$ready) {
             $entry = $this->receivers->register($wakeSlot);
-            $this->setWord(self::WORD_RECEIVERS_PARKED, $this->word(self::WORD_RECEIVERS_PARKED) + 1);
+            if ($entry !== null) {
+                // See parkForRoom(): a registration that found no free entry must not be
+                // counted, or the count never comes back down
+                $this->setWord(self::WORD_RECEIVERS_PARKED, $this->word(self::WORD_RECEIVERS_PARKED) + 1);
+            }
         }
 
         $this->arena->unlockMutexAt($this->mutex);
@@ -488,7 +753,62 @@ final class SharedChannel
     }
 
     /**
+     * Entries of $table whose owning process is gone, read without the lock
+     *
+     * Makes one liveness syscall per occupied entry, which is why no caller runs it inside a
+     * critical section. The raw word travels with the entry index so the release side can tell
+     * "still the registration I surveyed" from "released and re-taken since".
+     *
+     * @return list<array{entry: int, word: int}>
+     */
+    private function surveyDead(WaiterTable $table): array
+    {
+        $dead = [];
+        foreach ($table->entries() as $occupant) {
+            if (!$this->wake->isOwnerAlive($occupant['slot'], $occupant['pid'])) {
+                $dead[] = ['entry' => $occupant['entry'], 'word' => $occupant['word']];
+            }
+        }
+
+        return $dead;
+    }
+
+    /**
+     * Releases what surveyDead() found; the caller holds this channel's lock
+     *
+     * @param list<array{entry: int, word: int}> $dead
+     *
+     * @return int Entries actually released
+     */
+    private function releaseSurveyed(WaiterTable $table, array $dead, int $counterWord): int
+    {
+        $released = 0;
+        foreach ($dead as $stale) {
+            if ($table->wordAt($stale['entry']) !== $stale['word']) {
+                // Released and re-taken between the survey and the lock: the entry now belongs
+                // to somebody alive, and reclaiming it would unregister a live waiter
+                continue;
+            }
+            $table->release($stale['entry']);
+            $released++;
+        }
+
+        if ($released > 0) {
+            $this->setWord($counterWord, max($this->word($counterWord) - $released, 0));
+        }
+
+        return $released;
+    }
+
+    /**
      * Deregisters a waiter entry, under the lock, and drops the parked counter with it
+     *
+     * An entry that is already free is left alone rather than counted down again: a token
+     * outlives the call that made it, so a repeated cancel is a mistake a caller can actually
+     * make, and a parked count driven below the truth would close a rendezvous gate that should
+     * be open. This is not a licence to cancel twice - a token that has been cancelled must be
+     * dropped, because the entry it names may by then hold a NEW registration, which a second
+     * cancel would withdraw.
      */
     private function unpark(WaiterTable $table, ?int $entry, int $counterWord): void
     {
@@ -498,8 +818,10 @@ final class SharedChannel
 
         $recovered = $this->arena->lockMutexAt($this->mutex);
 
-        $table->release($entry);
-        $this->setWord($counterWord, max($this->word($counterWord) - 1, 0));
+        if ($table->wordAt($entry) !== 0) {
+            $table->release($entry);
+            $this->setWord($counterWord, max($this->word($counterWord) - 1, 0));
+        }
 
         $this->arena->unlockMutexAt($this->mutex);
 

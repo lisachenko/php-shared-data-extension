@@ -383,6 +383,23 @@ a package with no scheduler can offer: every primitive also exposes its non-bloc
 (`trySend()`/`tryRecv()`/`tryLock()`/`readSlot()`) plus `notificationStream()`, so a
 coroutine runtime can park a Fiber in its own event loop instead.
 
+A capacity-0 channel needs one thing more, because its gate is "is a receiver waiting" and a
+consumer with its own scheduler is never inside `recv()`:
+
+```php
+$token = $channel->registerReceiver();      // null => a record is already there, take it now
+// ... park the Fiber on notificationStream() in the consumer's own event loop ...
+$channel->cancelReceiver($token);           // on unpark, whatever woke it
+
+$ticket = $channel->trySendTicket($value);  // deposits only while a receiver is waiting
+$done   = $channel->isTicketTaken($ticket); // the handshake completes when it is TAKEN
+```
+
+The registration is a claim about presence, never about storage — the record goes into the
+one ring slot a capacity-0 channel allocates — so `cancelReceiver()` never has a value in its
+hands and can always succeed. A registration can outlive its process, so each waiter entry
+carries its owner pid and a rendezvous deposit reaps the dead ones before it reads the gate.
+
 ### Shared closures (registered before the fork)
 
 A closure compiled **before the fork** is valid in every worker: the family inherited the
