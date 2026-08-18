@@ -191,7 +191,7 @@ makes one of them "need updating", the change is wrong until proven otherwise.
   values that must travel do so as arena words or fixed-size socket records. One arena, one
   store and one notification plane per process — the plane must exist before any fork.
 - **Both minors, every time.** PHP 8.4 and 8.5 are supported in parallel, each with its own
-  z-engine line (`8.4.x-dev || 8.5.x-dev`, resolved by Composer against the running PHP).
+  z-engine line (`~8.4.2 || ~8.5.0`, resolved by Composer against the running PHP).
   Run the suite on both before proposing a change:
 
   ```bash
