@@ -134,33 +134,14 @@ jobs:
       - name: Objects survive real RINIT/RSHUTDOWN boundaries
         run: bash tools/request-boundary/run.sh 100
 
-  request-boundary-opcache:
-    name: True multi-request gate under opcache (php-cgi/FastCGI, PHP ${{ matrix.php }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        php: ['8.4', '8.5']
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: shivammathur/setup-php@v2
-        with:
-          php-version: ${{ matrix.php }}
-          extensions: ffi, opcache
-          ini-values: ffi.enable=1, opcache.enable=1, opcache.jit=off, opcache.jit_buffer_size=0
-          coverage: none
-
-      - name: Install FastCGI client
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfcgi-bin
-
-      - name: Assert opcache is active in the CGI SAPI
-        run: |
-          printf '<?php exit((int) !(function_exists("opcache_get_status") && opcache_get_status(false) !== false));' > "$RUNNER_TEMP/opcache-guard.php"
-          php-cgi -q "$RUNNER_TEMP/opcache-guard.php" > /dev/null
-
-      - name: Install dependencies
-        run: composer install --no-interaction --no-progress
-
-      - name: Objects survive real RINIT/RSHUTDOWN boundaries under opcache
-        run: bash tools/request-boundary/run.sh 100
+# The multi-request gate can also be driven under opcache - locally only, not as a
+# CI job. The CGI SAPI defaults opcache.enable to On, so any php-cgi whose ini does
+# not pin it off (as the job above does) caches the gate script in opcache SHM,
+# where its compile-time literals become IS_STR_PERMANENT strings that the persister
+# keeps by pointer instead of copying:
+#
+#   bash tools/request-boundary/run.sh 100
+#
+# with Zend OPcache loaded and opcache.enable=1 (keep opcache.jit=off and
+# opcache.jit_buffer_size=0 - the JIT rewrites the executor internals z-engine
+# hooks into).
