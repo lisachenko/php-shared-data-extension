@@ -20,7 +20,7 @@ jobs:
         with:
           php-version: ${{ matrix.php }}
           extensions: ffi
-          ini-values: ffi.enable=1, zend.assertions=1, opcache.jit=off
+          ini-values: ffi.enable=1, zend.assertions=1, opcache.enable=0, opcache.enable_cli=0, opcache.jit=off
           coverage: none
 
       - name: Validate composer manifest
@@ -30,6 +30,33 @@ jobs:
         run: composer install --no-interaction --no-progress
 
       - name: Unit and lifecycle tests
+        run: vendor/bin/phpunit
+
+  tests-opcache:
+    name: Tests under opcache (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4', '8.5']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: ffi, opcache
+          # JIT stays off: it rewrites the executor internals z-engine hooks into
+          ini-values: ffi.enable=1, zend.assertions=1, opcache.enable=1, opcache.enable_cli=1, opcache.jit=off, opcache.jit_buffer_size=0
+          coverage: none
+
+      - name: Assert opcache is active in the CLI SAPI
+        run: php -r 'exit((int) !(function_exists("opcache_get_status") && opcache_get_status(false) !== false && ini_get("opcache.enable_cli")));'
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress
+
+      - name: Unit and lifecycle tests under opcache
         run: vendor/bin/phpunit
 
   soak:
@@ -46,7 +73,7 @@ jobs:
         with:
           php-version: ${{ matrix.php }}
           extensions: ffi
-          ini-values: ffi.enable=1, opcache.jit=off
+          ini-values: ffi.enable=1, opcache.enable=0, opcache.enable_cli=0, opcache.jit=off
           coverage: none
 
       - name: Install dependencies
@@ -69,7 +96,7 @@ jobs:
         with:
           php-version: ${{ matrix.php }}
           extensions: ffi
-          ini-values: ffi.enable=1, opcache.jit=off
+          ini-values: ffi.enable=1, opcache.enable=0, opcache.enable_cli=0, opcache.jit=off
           coverage: none
 
       - name: Install dependencies
@@ -92,7 +119,10 @@ jobs:
         with:
           php-version: ${{ matrix.php }}
           extensions: ffi
-          ini-values: ffi.enable=1, opcache.jit=off
+          # opcache.enable=0 pins the posture: the CGI SAPI defaults it to On, so
+          # without the pin this gate silently runs under opcache on runners that
+          # ship the extension enabled
+          ini-values: ffi.enable=1, opcache.enable=0, opcache.enable_cli=0, opcache.jit=off
           coverage: none
 
       - name: Install FastCGI client
@@ -103,3 +133,15 @@ jobs:
 
       - name: Objects survive real RINIT/RSHUTDOWN boundaries
         run: bash tools/request-boundary/run.sh 100
+
+# The multi-request gate can also be driven under opcache - locally only, not as a
+# CI job. The CGI SAPI defaults opcache.enable to On, so any php-cgi whose ini does
+# not pin it off (as the job above does) caches the gate script in opcache SHM,
+# where its compile-time literals become IS_STR_PERMANENT strings that the persister
+# keeps by pointer instead of copying:
+#
+#   bash tools/request-boundary/run.sh 100
+#
+# with Zend OPcache loaded and opcache.enable=1 (keep opcache.jit=off and
+# opcache.jit_buffer_size=0 - the JIT rewrites the executor internals z-engine
+# hooks into).
