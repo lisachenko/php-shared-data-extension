@@ -541,8 +541,6 @@ rests on; [AGENTS.md](AGENTS.md) states the rules a change has to keep.
 ## Requirements
 
 - PHP 8.4, 8.5 or 8.6 (NTS) with `ext-ffi`
-- `lisachenko/z-engine` — required as `~8.4.2 || ~8.5.0 || ~8.6.0@dev`; z-engine tracks
-  one PHP minor per release line, and Composer resolves the line matching
-  the running PHP (`8.4.x` on PHP 8.4, `8.5.x` on PHP 8.5, `8.6.x-dev` on PHP 8.6 until
-  z-engine tags 8.6.0 — a project on PHP 8.6 requires `lisachenko/z-engine:8.6.x-dev` at its
-  root until then, since Composer only honours root stability flags)
+- `lisachenko/z-engine` — required as `~8.4.2 || ~8.5.0 || ~8.6.0`; z-engine tracks
+  one PHP minor per release line, and Composer resolves the stable line matching
+  the running PHP (`8.4.x` on PHP 8.4, `8.5.x` on PHP 8.5, `8.6.x` on PHP 8.6)

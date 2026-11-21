@@ -191,9 +191,8 @@ makes one of them "need updating", the change is wrong until proven otherwise.
   values that must travel do so as arena words or fixed-size socket records. One arena, one
   store and one notification plane per process — the plane must exist before any fork.
 - **Every minor, every time.** PHP 8.4, 8.5 and 8.6 are supported in parallel, each with its own
-  z-engine line (`~8.4.2 || ~8.5.0 || ~8.6.0@dev`, resolved by Composer against the running PHP;
-  8.6 rides z-engine's `8.6.x-dev` until it is tagged). Run the suite on all three before
-  proposing a change:
+  z-engine line (`~8.4.2 || ~8.5.0 || ~8.6.0`, resolved by Composer against the running PHP).
+  Run the suite on all three before proposing a change:
 
   ```bash
   php8.4 -d ffi.enable=1 -d opcache.jit=off vendor/bin/phpunit   # assert exit code 0
