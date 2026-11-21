@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lisachenko/php-shared-data-extension/actions/workflows/ci.yml/badge.svg)](https://github.com/lisachenko/php-shared-data-extension/actions/workflows/ci.yml)
 [![Latest Version](https://img.shields.io/packagist/v/lisachenko/php-shared-data-extension?include_prereleases)](https://packagist.org/packages/lisachenko/php-shared-data-extension)
-[![PHP 8.4 | 8.5](https://img.shields.io/badge/php-8.4%20%7C%208.5-777BB3.svg?logo=php&logoColor=white)](composer.json)
+[![PHP 8.4 | 8.5 | 8.6](https://img.shields.io/badge/php-8.4%20%7C%208.5%20%7C%208.6-777BB3.svg?logo=php&logoColor=white)](composer.json)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **PHP objects that survive the request boundary. In pure PHP.**
@@ -534,13 +534,13 @@ php -d ffi.enable=1 demos/demo-objects.php
 php -d ffi.enable=1 demo.php             # original shared C data demo
 ```
 
-CI runs all of the above on every push and pull request, on PHP 8.4 and 8.5.
+CI runs all of the above on every push and pull request, on PHP 8.4, 8.5 and 8.6.
 `spikes/` holds the runnable evidence behind the engine claims this package
 rests on; [AGENTS.md](AGENTS.md) states the rules a change has to keep.
 
 ## Requirements
 
-- PHP 8.4 or 8.5 (NTS) with `ext-ffi`
-- `lisachenko/z-engine` — required as `~8.4.2 || ~8.5.0`; z-engine tracks
+- PHP 8.4, 8.5 or 8.6 (NTS) with `ext-ffi`
+- `lisachenko/z-engine` — required as `~8.4.2 || ~8.5.0 || ~8.6.0`; z-engine tracks
   one PHP minor per release line, and Composer resolves the stable line matching
-  the running PHP (`8.4.x` on PHP 8.4, `8.5.x` on PHP 8.5)
+  the running PHP (`8.4.x` on PHP 8.4, `8.5.x` on PHP 8.5, `8.6.x` on PHP 8.6)
