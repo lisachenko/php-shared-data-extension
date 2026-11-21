@@ -29,7 +29,13 @@ php8.4 -d ffi.enable=1 -d opcache.jit=off spikes/s17-prefork-closures.php
 |---|---|---|
 | `s17-prefork-closures.php` | Can four children invoke closures registered before the fork barrier, by address, with correct results — and are the two ways of getting it wrong (registering after the barrier, registering from a worker) refused rather than resolved? | GREEN — 13 checks, both minors |
 
-All three run against this package's own `Arena`, so they double as end-to-end checks of the
+## Metrics spikes
+
+| File | Question | Verdict |
+|---|---|---|
+| `s18-sharded-metric-cells.php` | What does a shared increment cost through each path available today, does a per-worker cell lose updates under fork, and how much does false sharing cost? Evidence for [docs/prometheus-metrics-plan.md](../docs/prometheus-metrics-plan.md) | GREEN — exact totals with one writer per cell; ~30× cheaper than the mutex path uncontended |
+
+All of them run against this package's own `Arena`, so they double as end-to-end checks of the
 classes the rest of the epic builds on. `s17` is the mechanism that came out of the original
 S17 experiment rather than the experiment itself: the sweep held **post-fork** addresses on
 purpose and found a valid `Closure` of a different function behind one, which is why nothing
