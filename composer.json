@@ -3,13 +3,14 @@
     "description": "Shared data extension for PHP: persistent memory and request-surviving objects",
     "type": "library",
     "require": {
-        "lisachenko/z-engine": "~8.4.2 || ~8.5.0",
+        "lisachenko/z-engine": "~8.4.2 || ~8.5.0 || ~8.6.0@dev",
         "php": "^8.4",
         "ext-ffi": "*"
     },
     "require-dev": {
-        "phpunit/phpunit": "^12.2"
+        "phpunit/phpunit": "^12.3.6"
     },
+    "prefer-stable": true,
     "license": "MIT",
     "authors": [
         {
